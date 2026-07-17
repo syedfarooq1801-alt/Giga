@@ -18,9 +18,6 @@ import { Ionicons } from '@expo/vector-icons';
 
 type AuthMode = 'login' | 'signup';
 
-// onSuccess prop removed, navigation handled by parent
-
-
 const EmailAuthScreen = () => {
   const [mode, setMode] = useState<AuthMode>('login');
   const [email, setEmail] = useState('');
@@ -35,30 +32,31 @@ const EmailAuthScreen = () => {
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotLoading, setForgotLoading] = useState(false);
   const [forgotMessage, setForgotMessage] = useState('');
-  const [forgotMessageColor, setForgotMessageColor] = useState('#4caf50');
+  const [forgotSuccess, setForgotSuccess] = useState(true);
 
-  const scrollViewRef = useRef<any>(null); // ✅ ref to scroll view
+  const scrollViewRef = useRef<any>(null);
 
   const { signInWithEmail, signUpWithEmail, sendPasswordResetEmail } = useAuth();
-  const { colors } = useTheme();
+  const { colors, radius, typography } = useTheme();
+  const styles = makeStyles(colors, radius, typography);
 
   useEffect(() => {
     Keyboard.dismiss(); // Dismiss keyboard on mode change
     if (scrollViewRef.current) {
-      scrollViewRef.current.scrollTo({ y: 0, animated: true }); // ✅ Scroll to top when mode changes
+      scrollViewRef.current.scrollTo({ y: 0, animated: true });
     }
   }, [mode]);
 
   const handleForgotPassword = async () => {
     setForgotLoading(true);
     setForgotMessage('');
-    setForgotMessageColor('#4caf50');
+    setForgotSuccess(true);
     try {
       await sendPasswordResetEmail(forgotEmail.trim());
       setForgotMessage('If this email exists, a reset link has been sent.');
     } catch (err: any) {
       setForgotMessage('Failed to send reset link. Try again.');
-      setForgotMessageColor('#f44336');
+      setForgotSuccess(false);
     } finally {
       setForgotLoading(false);
     }
@@ -72,7 +70,8 @@ const EmailAuthScreen = () => {
       if (mode === 'login') {
         await signInWithEmail(email, password);
         // Navigation will be handled by parent on auth state change
-      } else { // signup mode
+      } else {
+        // signup mode
         if (password !== confirmPassword) {
           throw new Error('Passwords do not match');
         }
@@ -80,17 +79,13 @@ const EmailAuthScreen = () => {
           throw new Error('Name and username are required');
         }
         await signUpWithEmail(email, password, name, username);
-        // Clear the form
         setEmail('');
         setPassword('');
         setConfirmPassword('');
         setName('');
         setUsername('');
-        // Show success message
         alert('Account created successfully! Please log in.');
-        // Switch to login mode
         setMode('login');
-        // Force a full page reload to get a fresh login page
         window.location.href = window.location.origin + '/login';
       }
     } catch (err: any) {
@@ -154,9 +149,7 @@ const EmailAuthScreen = () => {
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.formContainer}>
-          <Text style={[styles.title, { color: colors.text }]}>
-            {mode === 'login' ? 'Welcome to Giga BhAI' : 'Create Account'}
-          </Text>
+          <Text style={styles.title}>{mode === 'login' ? 'Welcome to Giga BhAI' : 'Create Account'}</Text>
 
           {error ? (
             <View style={styles.errorContainer}>
@@ -165,13 +158,16 @@ const EmailAuthScreen = () => {
           ) : null}
 
           <View style={styles.inputContainer}>
-            <Text style={[styles.label, { color: colors.text }]}>Email</Text>
+            <Text style={styles.label}>Email</Text>
             <TextInput
-              style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.inputBorder }]}
+              style={styles.input}
               placeholder="Enter your email"
-              placeholderTextColor={colors.timestamp}
+              placeholderTextColor={colors.sub}
               value={email}
-              onChangeText={(text: string) => { setEmail(text); setError(''); }}
+              onChangeText={(text: string) => {
+                setEmail(text);
+                setError('');
+              }}
               keyboardType="email-address"
               autoCapitalize="none"
               autoCorrect={false}
@@ -182,25 +178,31 @@ const EmailAuthScreen = () => {
           {mode === 'signup' && (
             <>
               <View style={styles.inputContainer}>
-                <Text style={[styles.label, { color: colors.text }]}>Full Name</Text>
+                <Text style={styles.label}>Full Name</Text>
                 <TextInput
-                  style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.inputBorder }]}
+                  style={styles.input}
                   placeholder="Enter your full name"
-                  placeholderTextColor={colors.timestamp}
+                  placeholderTextColor={colors.sub}
                   value={name}
-                  onChangeText={(text: string) => { setName(text); setError(''); }}
+                  onChangeText={(text: string) => {
+                    setName(text);
+                    setError('');
+                  }}
                   editable={!loading}
                 />
               </View>
 
               <View style={styles.inputContainer}>
-                <Text style={[styles.label, { color: colors.text }]}>Username</Text>
+                <Text style={styles.label}>Username</Text>
                 <TextInput
-                  style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.inputBorder }]}
+                  style={styles.input}
                   placeholder="Choose a username"
-                  placeholderTextColor={colors.timestamp}
+                  placeholderTextColor={colors.sub}
                   value={username}
-                  onChangeText={(text: string) => { setUsername(text); setError(''); }}
+                  onChangeText={(text: string) => {
+                    setUsername(text);
+                    setError('');
+                  }}
                   autoCapitalize="none"
                   autoCorrect={false}
                   editable={!loading}
@@ -210,58 +212,44 @@ const EmailAuthScreen = () => {
           )}
 
           <View style={styles.inputContainer}>
-            <Text style={[styles.label, { color: colors.text }]}>Password</Text>
+            <Text style={styles.label}>Password</Text>
             <View style={{ position: 'relative' }}>
               <TextInput
-                style={[
-                  styles.input,
-                  {
-                    backgroundColor: colors.background,
-                    color: colors.text,
-                    borderColor: colors.inputBorder,
-                    paddingRight: 44, // space for the icon
-                  },
-                ]}
+                style={[styles.input, { paddingRight: 44 }]}
                 placeholder="Enter your password"
-                placeholderTextColor={colors.timestamp}
+                placeholderTextColor={colors.sub}
                 value={password}
-                onChangeText={(text: string) => { setPassword(text); setError(''); }}
+                onChangeText={(text: string) => {
+                  setPassword(text);
+                  setError('');
+                }}
                 secureTextEntry={!showPassword}
                 editable={!loading}
               />
               <TouchableOpacity
                 onPress={() => setShowPassword(!showPassword)}
                 accessibilityLabel={showPassword ? 'Hide password' : 'Show password'}
-                style={{
-                  position: 'absolute',
-                  right: 6,
-                  top: 0,
-                  height: '100%',
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  width: 36,
-                }}
+                style={styles.eyeButton}
                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                 activeOpacity={0.7}
               >
-                <Ionicons
-                  name={showPassword ? 'eye-off' : 'eye'}
-                  size={24}
-                  color={colors.text === '#fff' ? '#222' : '#555'}
-                />
+                <Ionicons name={showPassword ? 'eye-off' : 'eye'} size={22} color={colors.sub} />
               </TouchableOpacity>
             </View>
           </View>
 
           {mode === 'signup' && (
             <View style={styles.inputContainer}>
-              <Text style={[styles.label, { color: colors.text }]}>Confirm Password</Text>
+              <Text style={styles.label}>Confirm Password</Text>
               <TextInput
-                style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.inputBorder }]}
+                style={styles.input}
                 placeholder="Confirm your password"
-                placeholderTextColor={colors.timestamp}
+                placeholderTextColor={colors.sub}
                 value={confirmPassword}
-                onChangeText={(text: string) => { setConfirmPassword(text); setError(''); }}
+                onChangeText={(text: string) => {
+                  setConfirmPassword(text);
+                  setError('');
+                }}
                 secureTextEntry
                 editable={!loading}
               />
@@ -269,37 +257,31 @@ const EmailAuthScreen = () => {
           )}
 
           <TouchableOpacity
-            style={[styles.button, { backgroundColor: colors.primary }]}
+            style={[styles.button, { opacity: !isFormValid() || loading ? 0.6 : 1 }]}
             onPress={handleSubmit}
             disabled={!isFormValid() || loading}
           >
             {loading ? (
-              <ActivityIndicator color="#fff" />
+              <ActivityIndicator color={colors.accentContrast} />
             ) : (
-              <Text style={styles.buttonText}>
-                {mode === 'login' ? 'Log In' : 'Sign Up'}
-              </Text>
+              <Text style={styles.buttonText}>{mode === 'login' ? 'Log In' : 'Sign Up'}</Text>
             )}
           </TouchableOpacity>
 
           {mode === 'login' && (
-            <TouchableOpacity
-              style={{ marginTop: 10, alignItems: 'center' }}
-              onPress={() => setShowForgotPassword(true)}
-              disabled={loading}
-            >
-              <Text style={{ color: colors.primary, fontSize: 14 }}>Forgot Password?</Text>
+            <TouchableOpacity style={styles.linkButton} onPress={() => setShowForgotPassword(true)} disabled={loading}>
+              <Text style={styles.linkText}>Forgot Password?</Text>
             </TouchableOpacity>
           )}
 
           {showForgotPassword && (
-            <View style={{ marginTop: 24, padding: 16, backgroundColor: colors.background, borderRadius: 10 }}>
-              <Text style={{ color: colors.text, fontWeight: 'bold', marginBottom: 8 }}>Reset Password</Text>
-              <Text style={{ color: colors.text, marginBottom: 8, fontSize: 13 }}>Enter your email address and we'll send you a reset link.</Text>
+            <View style={styles.forgotCard}>
+              <Text style={styles.forgotTitle}>Reset Password</Text>
+              <Text style={styles.forgotBody}>Enter your email address and we'll send you a reset link.</Text>
               <TextInput
-                style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.inputBorder }]}
+                style={styles.input}
                 placeholder="Email"
-                placeholderTextColor={colors.timestamp}
+                placeholderTextColor={colors.sub}
                 value={forgotEmail}
                 onChangeText={setForgotEmail}
                 keyboardType="email-address"
@@ -308,38 +290,36 @@ const EmailAuthScreen = () => {
                 editable={!forgotLoading}
               />
               <TouchableOpacity
-                style={[styles.button, { backgroundColor: colors.primary, marginTop: 12 }]}
+                style={[styles.button, { marginTop: 12 }]}
                 onPress={handleForgotPassword}
                 disabled={forgotLoading || !forgotEmail.includes('@')}
               >
                 {forgotLoading ? (
-                  <ActivityIndicator color="#fff" />
+                  <ActivityIndicator color={colors.accentContrast} />
                 ) : (
                   <Text style={styles.buttonText}>Send Reset Link</Text>
                 )}
               </TouchableOpacity>
               {forgotMessage ? (
-                <Text style={{ color: forgotMessageColor, marginTop: 8, textAlign: 'center', fontSize: 13 }}>{forgotMessage}</Text>
+                <Text style={[styles.forgotMessage, { color: forgotSuccess ? colors.success : colors.danger }]}>
+                  {forgotMessage}
+                </Text>
               ) : null}
               <TouchableOpacity
-                style={{ marginTop: 10, alignItems: 'center' }}
+                style={styles.linkButton}
                 onPress={() => {
                   setShowForgotPassword(false);
                   setForgotMessage('');
                   setForgotEmail('');
                 }}
               >
-                <Text style={{ color: colors.primary, fontSize: 14 }}>Cancel</Text>
+                <Text style={styles.linkText}>Cancel</Text>
               </TouchableOpacity>
             </View>
           )}
 
-          <TouchableOpacity
-            style={styles.switchModeButton}
-            onPress={() => setMode(mode === 'login' ? 'signup' : 'login')}
-            disabled={loading}
-          >
-            <Text style={[styles.switchModeText, { color: colors.primary }]}>
+          <TouchableOpacity style={styles.switchModeButton} onPress={() => setMode(mode === 'login' ? 'signup' : 'login')} disabled={loading}>
+            <Text style={styles.switchModeText}>
               {mode === 'login' ? "Don't have an account? Sign Up" : 'Already have an account? Log In'}
             </Text>
           </TouchableOpacity>
@@ -349,72 +329,71 @@ const EmailAuthScreen = () => {
   );
 };
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  scrollContainer: {
-    flexGrow: 1,
-    justifyContent: 'center',
-    padding: 20,
-  },
-  formContainer: {
-    width: '100%',
-    maxWidth: 400,
-    alignSelf: 'center',
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    marginBottom: 24,
-    textAlign: 'center',
-  },
-  inputContainer: {
-    marginBottom: 16,
-  },
-  label: {
-    marginBottom: 8,
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  input: {
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
-    marginTop: 4,
-  },
-  button: {
-    marginTop: 8,
-    padding: 16,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  switchModeButton: {
-    marginTop: 16,
-    padding: 12,
-    alignItems: 'center',
-  },
-  switchModeText: {
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  errorContainer: {
-    backgroundColor: 'rgba(255, 0, 0, 0.1)',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 16,
-  },
-  errorText: {
-    color: 'red',
-    textAlign: 'center',
-  },
-});
+const makeStyles = (colors: any, radius: any, typography: any) =>
+  StyleSheet.create({
+    container: { flex: 1 },
+    scrollContainer: { flexGrow: 1, justifyContent: 'center', padding: 20 },
+    formContainer: { width: '100%', maxWidth: 400, alignSelf: 'center' },
+    title: {
+      fontSize: typography.size.xl,
+      fontWeight: typography.weight.black,
+      letterSpacing: typography.letterSpacingTight,
+      marginBottom: 28,
+      textAlign: 'center',
+      color: colors.ink,
+      fontFamily: typography.fontFamily,
+    },
+    inputContainer: { marginBottom: 16 },
+    label: { marginBottom: 8, fontSize: typography.size.sm, fontWeight: typography.weight.semibold, color: colors.ink },
+    input: {
+      borderWidth: 1,
+      borderColor: colors.line,
+      borderRadius: radius.md,
+      padding: 13,
+      fontSize: typography.size.base,
+      backgroundColor: colors.surface,
+      color: colors.ink,
+    },
+    eyeButton: {
+      position: 'absolute',
+      right: 6,
+      top: 0,
+      height: '100%',
+      justifyContent: 'center',
+      alignItems: 'center',
+      width: 36,
+    },
+    button: {
+      marginTop: 8,
+      padding: 15,
+      borderRadius: radius.pill,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.accent,
+    },
+    buttonText: { color: colors.accentContrast, fontSize: typography.size.base, fontWeight: typography.weight.bold },
+    linkButton: { marginTop: 12, padding: 10, alignItems: 'center' },
+    linkText: { fontSize: typography.size.sm, fontWeight: typography.weight.medium, color: colors.accent },
+    switchModeButton: { marginTop: 16, padding: 12, alignItems: 'center' },
+    switchModeText: { fontSize: typography.size.sm, fontWeight: typography.weight.medium, color: colors.accent },
+    errorContainer: {
+      backgroundColor: colors.dangerBg,
+      padding: 12,
+      borderRadius: radius.md,
+      marginBottom: 16,
+    },
+    errorText: { color: colors.danger, textAlign: 'center', fontSize: typography.size.sm },
+    forgotCard: {
+      marginTop: 24,
+      padding: 16,
+      backgroundColor: colors.surface,
+      borderRadius: radius.md,
+      borderWidth: 1,
+      borderColor: colors.line,
+    },
+    forgotTitle: { color: colors.ink, fontWeight: typography.weight.bold, marginBottom: 8, fontSize: typography.size.base },
+    forgotBody: { color: colors.sub, marginBottom: 8, fontSize: 13 },
+    forgotMessage: { marginTop: 8, textAlign: 'center', fontSize: 13 },
+  });
 
 export default EmailAuthScreen;

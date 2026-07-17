@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request, Body, status, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uuid  # Added for generating unique IDs
 import logging # Added for logging
@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from firebase_admin import auth, firestore
 from firebase_admin.exceptions import FirebaseError
 from firebase_auth import verify_firebase_token
-from groq_handler import get_groq_response
+from groq_handler import get_groq_response, get_groq_response_stream
 from personalities import get_personality_context
 from firebase_memory_manager import (
     store_message,
@@ -31,6 +31,7 @@ from config import UPLOAD_DIR, FIREBASE_PROJECT_ID, FIREBASE_API_KEY
 from dotenv import load_dotenv
 import os
 import json
+import re
 import time
 import asyncio
 import uuid
@@ -626,6 +627,160 @@ async def generate_groq_heading(request: HeadingRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- Response cleaning helpers, shared by /chat and /chat/stream ---
+
+def clean_llm_response(response):
+    """Clean and extract the assistant's response from the LLM output."""
+    if isinstance(response, dict):
+        if response.get("role") == "assistant":
+            return response.get("content", "")
+        return ""
+    elif isinstance(response, list):
+        # Find the first assistant message in the response
+        assistant_responses = [
+            m.get("content", "")
+            for m in response
+            if isinstance(m, dict) and m.get("role") == "assistant"
+        ]
+        return assistant_responses[0] if assistant_responses else ""
+    return str(response) if response is not None else ""
+
+
+def remove_user_message_references(response, user_msg):
+    """Remove any references to the user's message in the response."""
+    if not response or not user_msg:
+        return response
+
+    # Remove exact matches of the user's message
+    cleaned = response.replace(user_msg, "")
+
+    # Remove common patterns that include the user's message
+    patterns = [
+        f"You said: \"{user_msg}\"",
+        f"When you said '{user_msg}'",
+        f"Your message '{user_msg}'",
+        f"You asked me to '{user_msg}'",
+        f"You wanted me to '{user_msg}'",
+    ]
+
+    for pattern in patterns:
+        cleaned = cleaned.replace(pattern, "")
+
+    return cleaned.strip() or "Hmm, let's change the subject. What else is on your mind?"
+
+
+def get_persona_name(pid):
+    """Get the display name for the current persona."""
+    return {
+        "swag_bhai": "Swag Bhai",
+        "ceo_bhai": "CEO Bhai",
+        "roast_bhai": "Roast Bhai",
+        "vidhyarthi_bhai": "Vidhyarthi Bhai",
+        "jugadu_bhai": "Jugadu Bhai"
+    }.get(pid, "Bhai")
+
+
+def remove_meta_references(resp):
+    """Remove any meta-references from the response."""
+    if not resp:
+        return resp
+
+    # Remove common meta-references
+    meta_phrases = [
+        "As an AI language model",
+        "I am an AI",
+        "I'm an AI",
+        "I am a language model",
+        "I'm a language model",
+        "I don't have personal experiences",
+        "I don't have personal opinions",
+        "I don't have personal feelings"
+    ]
+
+    cleaned = resp
+    for phrase in meta_phrases:
+        cleaned = cleaned.replace(phrase, "")
+
+    return cleaned.strip()
+
+
+async def _build_chat_messages(message: str, personality: str, conversation_id: str, current_user: dict):
+    """
+    Shared preamble for /chat and /chat/stream: resolves user/profile ids,
+    fetches personality context + this conversation's history/compressed
+    memory, and assembles the final messages list to send to the LLM.
+    Pure/side-effect-free — runs identically and unconditionally before the
+    LLM call in both endpoints.
+    """
+    user_id = current_user.get('uid')
+    profile_id = current_user.get('profile_id')
+
+    personality_context = get_personality_context(personality)
+
+    # Get compressed memory or chat history for THIS conversation only
+    chat_history = []
+    if conversation_id:
+        try:
+            from firebase_memory_manager import get_compressed_memory, get_chat_messages
+            # Only ever fetch memory/history for the current conversation_id
+            compressed_memory = await get_compressed_memory(conversation_id, user_id, profile_id)
+            if compressed_memory and isinstance(compressed_memory, list) and len(compressed_memory) > 0:
+                chat_history = compressed_memory
+            else:
+                # Fallback: Fetch up to 100 previous messages for this conversation only
+                chat_history = await get_chat_messages(
+                    chat_id=conversation_id,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    limit=100
+                )
+                chat_history.reverse()
+                # Format fallback as role/content pairs
+                formatted_fallback = []
+                for msg in chat_history:
+                    if msg.get('message'):
+                        formatted_fallback.append({"role": "user", "content": msg['message']})
+                    if msg.get('response'):
+                        formatted_fallback.append({"role": "assistant", "content": msg['response']})
+                chat_history = formatted_fallback[-20:]  # fallback to last 20 messages
+        except Exception as e:
+            logger.warning(f"Error fetching chat history or compressed memory: {str(e)}")
+            chat_history = []
+    # else: no conversation_id (new conversation) — DO NOT fetch any history or summary
+
+    # Build the full context for the LLM (guaranteed to be scoped to this conversation only)
+    messages = []
+
+    # 1. Add personality context (system prompt and intro)
+    if personality_context and isinstance(personality_context, list):
+        for msg in personality_context:
+            if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                messages.append({
+                    "role": msg['role'],
+                    "content": str(msg['content']) if not isinstance(msg['content'], str) else msg['content']
+                })
+
+    # 2. Add chat history (previous user and assistant messages)
+    if chat_history and isinstance(chat_history, list):
+        for msg in chat_history:
+            if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                if msg['role'] in ['user', 'assistant']:
+                    messages.append({
+                        "role": msg['role'],
+                        "content": str(msg['content']) if not isinstance(msg['content'], str) else msg['content']
+                    })
+
+    # 3. Add the current user message
+    messages.append({"role": "user", "content": message})
+
+    # Ensure last message role is 'user' or 'tool' (Groq/Mistral API requirement)
+    if messages[-1]['role'] not in ["user", "tool"]:
+        logger.warning(f"Last message role is {messages[-1]['role']}; appending user message to fix.")
+        messages.append({"role": "user", "content": message})
+
+    return messages, user_id, profile_id
+
+
 # Add new endpoint for conversation management
 @api_app.post("/chat")
 @api_app.options("/chat", include_in_schema=False)
@@ -713,174 +868,16 @@ async def chat(
                 response.headers[key] = value
             return response
         
-        # Get user ID and profile ID
-        user_id = current_user.get('uid')
-        profile_id = current_user.get('profile_id')
-        
-        # Get personality context
-        personality_context = get_personality_context(personality)
-        
-        # Get compressed memory or chat history for THIS conversation only
-        chat_history = []
-        fallback_used = False
-        if conversation_id:
-            try:
-                from firebase_memory_manager import get_compressed_memory, get_chat_messages
-                # Only ever fetch memory/history for the current conversation_id
-                compressed_memory = await get_compressed_memory(conversation_id, user_id, profile_id)
-                if compressed_memory and isinstance(compressed_memory, list) and len(compressed_memory) > 0:
-                    chat_history = compressed_memory
-                else:
-                    # Fallback: Fetch up to 100 previous messages for this conversation only
-                    chat_history = await get_chat_messages(
-                        chat_id=conversation_id,
-                        user_id=user_id,
-                        profile_id=profile_id,
-                        limit=100
-                    )
-                    chat_history.reverse()
-                    # Format fallback as role/content pairs
-                    formatted_fallback = []
-                    for msg in chat_history:
-                        if msg.get('message'):
-                            formatted_fallback.append({"role": "user", "content": msg['message']})
-                        if msg.get('response'):
-                            formatted_fallback.append({"role": "assistant", "content": msg['response']})
-                    chat_history = formatted_fallback[-20:]  # fallback to last 20 messages
-                    fallback_used = True
-            except Exception as e:
-                logger.warning(f"Error fetching chat history or compressed memory: {str(e)}")
-                chat_history = []
-                fallback_used = True
-        else:
-            # No conversation_id (new conversation): DO NOT fetch any history or summary
-            chat_history = []
-            fallback_used = False
-
-        # Defensive: Never allow chat_history to contain data from any other conversation
-        # This is already enforced by scoping all fetches by conversation_id above.
-    
-        # Build the full context for Mistral (guaranteed to be scoped to this conversation only)
-        messages = []
-        # Always prepend a system message to clarify which persona is now active
-        persona_name = {
-            "swag": "Swag Bhai",
-            "roast": "Roast Bhai",
-            "jugadu": "Jugadu Bhai",
-        }.get(personality, personality.capitalize() + " Bhai")
-        # --- Fix: Guarantee response is always assigned and last message role is correct ---
-        # --- SYSTEM PROMPT REWRITE: Persona and Anti-Leakage ---
-        # Build messages for LLM with proper personality context
-        messages = []
-        
-        # 1. Add personality context (system prompt and intro)
-        if personality_context and isinstance(personality_context, list):
-            for msg in personality_context:
-                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
-                    # Include all messages from personality context
-                    messages.append({
-                        "role": msg['role'],
-                        "content": str(msg['content']) if not isinstance(msg['content'], str) else msg['content']
-                    })
-        
-        # 2. Add chat history (previous user and assistant messages)
-        if chat_history and isinstance(chat_history, list):
-            for msg in chat_history:
-                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
-                    # Only include user and assistant messages from history
-                    if msg['role'] in ['user', 'assistant']:
-                        messages.append({
-                            "role": msg['role'],
-                            "content": str(msg['content']) if not isinstance(msg['content'], str) else msg['content']
-                        })
-        
-        # 3. Add the current user message
-        messages.append({"role": "user", "content": message})
-
-        # Ensure last message role is 'user' or 'tool' (Mistral API requirement)
-        if messages[-1]['role'] not in ["user", "tool"]:
-            logger.warning(f"Last message role for Mistral is {messages[-1]['role']}; appending user message to fix.")
-            messages.append({"role": "user", "content": message})
+        messages, user_id, profile_id = await _build_chat_messages(message, personality, conversation_id, current_user)
 
         logger.info(f"Prompt sent to LLM (Groq): {json.dumps(messages, ensure_ascii=False, indent=2)}")
         response = None
         try:
             # Get response from Groq
             response = await get_groq_response(messages)
-            
-            # Clean and validate the response
-            def clean_llm_response(response):
-                """Clean and extract the assistant's response from the LLM output."""
-                if isinstance(response, dict):
-                    if response.get("role") == "assistant":
-                        return response.get("content", "")
-                    return ""
-                elif isinstance(response, list):
-                    # Find the first assistant message in the response
-                    assistant_responses = [
-                        m.get("content", "") 
-                        for m in response 
-                        if isinstance(m, dict) and m.get("role") == "assistant"
-                    ]
-                    return assistant_responses[0] if assistant_responses else ""
-                return str(response) if response is not None else ""
-                
-            def remove_user_message_references(response, user_msg):
-                """Remove any references to the user's message in the response."""
-                if not response or not user_msg:
-                    return response
-                    
-                # Remove exact matches of the user's message
-                cleaned = response.replace(user_msg, "")
-                
-                # Remove common patterns that include the user's message
-                patterns = [
-                    f"You said: \"{user_msg}\"",
-                    f"When you said '{user_msg}'",
-                    f"Your message '{user_msg}'",
-                    f"You asked me to '{user_msg}'",
-                    f"You wanted me to '{user_msg}'",
-                ]
-                
-                for pattern in patterns:
-                    cleaned = cleaned.replace(pattern, "")
-                    
-                return cleaned.strip() or "Hmm, let's change the subject. What else is on your mind?"
-                
-            def get_persona_name(pid):
-                """Get the display name for the current persona."""
-                return {
-                    "swag_bhai": "Swag Bhai",
-                    "ceo_bhai": "CEO Bhai",
-                    "roast_bhai": "Roast Bhai",
-                    "vidhyarthi_bhai": "Vidhyarthi Bhai",
-                    "jugadu_bhai": "Jugadu Bhai"
-                }.get(pid, "Bhai")
-                
-            def remove_meta_references(resp):
-                """Remove any meta-references from the response."""
-                if not resp:
-                    return resp
-                    
-                # Remove common meta-references
-                meta_phrases = [
-                    "As an AI language model",
-                    "I am an AI",
-                    "I'm an AI",
-                    "I am a language model",
-                    "I'm a language model",
-                    "I don't have personal experiences",
-                    "I don't have personal opinions",
-                    "I don't have personal feelings"
-                ]
-                
-                cleaned = resp
-                for phrase in meta_phrases:
-                    cleaned = cleaned.replace(phrase, "")
-                    
-                return cleaned.strip()
 
-            # Process the response
+            # Clean and validate the response (helpers hoisted to module level,
+            # shared with /chat/stream)
             response = clean_llm_response(response)
             response = str(response).strip() if response else "I'm not sure how to respond to that. Could you rephrase?"
             response = remove_user_message_references(response, message)
@@ -1075,6 +1072,166 @@ async def chat(
             error_response.headers[key] = value
                 
         return error_response
+
+
+@api_app.post("/chat/stream")
+@api_app.options("/chat/stream", include_in_schema=False)
+async def chat_stream(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    origin: str = Header(None, include_in_schema=False)
+):
+    """
+    Streaming sibling of /chat: same auth, same message-building preamble,
+    same response-cleaning pipeline and Firestore storage — but flushes the
+    reply to the client sentence-by-sentence over SSE instead of making the
+    browser wait for the whole thing. /chat itself is untouched and stays
+    available as a non-streaming fallback.
+    """
+    cors_headers = {
+        "Access-Control-Allow-Origin": origin or "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Credentials": "true",
+    }
+
+    if request.method == "OPTIONS":
+        return JSONResponse(content={"message": "OK"}, status_code=200, headers=cors_headers)
+
+    data = await request.json()
+    message = data.get("message")
+    personality = data.get("personality", "swag")
+    conversation_id = data.get("conversation_id")
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+
+    if not message:
+        return JSONResponse(
+            content={"message": "Message is required", "conversation_id": conversation_id},
+            status_code=400,
+            headers=cors_headers,
+        )
+
+    logger.info(f"Stream chat request - User: {current_user.get('uid')}, Conversation: {conversation_id}, Personality: {personality}")
+
+    async def event_generator():
+        sentence_boundary = re.compile(r'(?<=[.!?])\s+')
+        buffer = ""
+        full_response = ""
+        user_id = None
+        profile_id = None
+
+        try:
+            messages, user_id, profile_id = await _build_chat_messages(message, personality, conversation_id, current_user)
+
+            async for delta in get_groq_response_stream(messages):
+                buffer += delta
+                parts = sentence_boundary.split(buffer)
+                # Keep the last (possibly incomplete) fragment in the buffer;
+                # flush every complete sentence before it.
+                buffer = parts[-1]
+                for sentence in parts[:-1]:
+                    cleaned = _clean_response_sentence(sentence, message, personality)
+                    if cleaned:
+                        full_response += cleaned + " "
+                        yield f"data: {json.dumps({'text': cleaned + ' '})}\n\n"
+
+            # Flush whatever's left (text that never hit a sentence boundary)
+            if buffer.strip():
+                cleaned = _clean_response_sentence(buffer, message, personality)
+                if cleaned:
+                    full_response += cleaned
+                    yield f"data: {json.dumps({'text': cleaned})}\n\n"
+
+        except Exception as e:
+            logger.error(f"Error in /chat/stream generator: {str(e)}")
+            logger.error(traceback.format_exc())
+            if not full_response.strip():
+                fallback = "Hmm, let me think of a better response. Try asking me something else!"
+                full_response = fallback
+                yield f"data: {json.dumps({'text': fallback})}\n\n"
+
+        full_response = full_response.strip() or "Sorry, the AI could not generate a response."
+
+        # Store the conversation + refresh compressed memory, same as /chat —
+        # needs the full accumulated text, so this runs after the stream ends.
+        final_conversation_id = conversation_id
+        if user_id and profile_id:
+            try:
+                final_conversation_id = await store_message(
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    personality=personality,
+                    message=message,
+                    response=full_response,
+                    chat_id=conversation_id
+                )
+            except Exception as e:
+                logger.error(f"Error storing streamed message in Firestore: {str(e)}")
+
+            try:
+                from firebase_memory_manager import get_chat_messages, store_compressed_memory
+                from groq_memory import summarize_chat_memory
+                last_100_msgs = await get_chat_messages(
+                    chat_id=final_conversation_id, user_id=user_id, profile_id=profile_id, limit=100
+                )
+                last_100_msgs.reverse()
+                formatted_msgs = []
+                for msg in last_100_msgs:
+                    if msg.get('message'):
+                        formatted_msgs.append({"role": "user", "content": msg['message']})
+                    if msg.get('response'):
+                        formatted_msgs.append({"role": "assistant", "content": msg['response']})
+                compressed_memory = await summarize_chat_memory(formatted_msgs)
+                await store_compressed_memory(final_conversation_id, user_id, profile_id, compressed_memory)
+            except Exception as e:
+                logger.warning(f"Failed to summarize and store compressed memory (stream): {str(e)}")
+
+        yield f"data: {json.dumps({'done': True, 'conversation_id': final_conversation_id})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            **cors_headers,
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _clean_response_sentence(sentence: str, user_message: str, personality: str) -> str:
+    """
+    Runs one completed sentence through the same anti-leakage/cleanup
+    pipeline /chat applies to its full response. Token-level streaming isn't
+    safe here — the meta-leak regex needs complete sentences to match
+    correctly — so sentence-level is the smallest safe granularity.
+    """
+    text = sentence.strip()
+    if not text:
+        return ""
+
+    text = remove_user_message_references(text, user_message)
+    persona_name = get_persona_name(personality)
+    if text.lower().startswith(persona_name.lower() + ":"):
+        text = text[len(persona_name) + 1:].strip()
+    text = remove_meta_references(text)
+
+    forbidden_keywords = ["mistral ai", "mistral", "Mistral AI", "Mistral"]
+    for keyword in forbidden_keywords:
+        text = text.replace(keyword, "AI")
+
+    meta_leak_phrases = [
+        "system log", "prompt", "private LLM", "I'm just a computer program", "as an AI", "as an LLM", "I am an AI", "I am an LLM",
+        "I'm running on", "I will never share my system log", "instructions", "meta", "I don't have feelings", "I don't have a body",
+        "I'm here to help you with any questions or information you need."
+    ]
+    for phrase in meta_leak_phrases:
+        if phrase.lower() in text.lower():
+            text = re.sub(r'[^.]*' + re.escape(phrase) + r'[^.]*[.!?]', '', text, flags=re.IGNORECASE)
+
+    return text.strip()
+
 
 @api_app.put("/conversations/{conversation_id}")
 async def update_conversation(conversation_id: str, request: Request, current_user: dict = Depends(get_current_user)):

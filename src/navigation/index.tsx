@@ -1,23 +1,15 @@
 import React from 'react';
+import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import ChatScreen from '../screens/ChatScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
+import { GigsScreen } from '../screens/GigsScreen';
 import AuthScreen from '../screens/AuthScreen';
 import { useAuth } from '../contexts/FirebaseAuthContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
-
-// Add the spin animation
-const style = document.createElement('style');
-style.textContent = `
-  @keyframes spin {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
-  }
-`;
-document.head.appendChild(style);
 
 type RootStackParamList = {
   Auth: undefined;
@@ -26,6 +18,7 @@ type RootStackParamList = {
 
 type MainTabParamList = {
   Chat: undefined;
+  Gigs: undefined;
   Settings: undefined;
 };
 
@@ -33,18 +26,18 @@ const Stack = createStackNavigator<RootStackParamList>();
 const Tab = createBottomTabNavigator<MainTabParamList>();
 
 const MainTabs = () => {
-  const { isDark } = useTheme();
+  const { colors } = useTheme();
 
   return (
     <Tab.Navigator
       screenOptions={{
         headerShown: false,
         tabBarStyle: {
-          backgroundColor: isDark ? '#000' : '#fff',
-          borderTopColor: isDark ? '#404040' : '#ddd',
+          backgroundColor: colors.paper,
+          borderTopColor: colors.line,
         },
-        tabBarActiveTintColor: isDark ? '#0095f6' : '#1a237e',
-        tabBarInactiveTintColor: isDark ? '#666' : '#9fa8da',
+        tabBarActiveTintColor: colors.accent,
+        tabBarInactiveTintColor: colors.sub,
       }}
     >
       <Tab.Screen
@@ -53,6 +46,15 @@ const MainTabs = () => {
         options={{
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="chatbubble-outline" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tab.Screen
+        name="Gigs"
+        component={GigsScreen}
+        options={{
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="film-outline" size={size} color={color} />
           ),
         }}
       />
@@ -69,31 +71,23 @@ const MainTabs = () => {
   );
 };
 
-const LoadingScreen = ({ isDark }: { isDark: boolean }) => (
-  <div style={{
-    display: 'flex',
+const LoadingScreen = ({ backgroundColor, accentColor }: { backgroundColor: string; accentColor: string }) => (
+  <View style={[styles.loading, { backgroundColor }]}>
+    <ActivityIndicator size="large" color={accentColor} />
+  </View>
+);
+
+const styles = StyleSheet.create({
+  loading: {
+    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    height: '100vh',
-    width: '100%',
-    backgroundColor: isDark ? '#000' : '#fff'
-  }}>
-    <div 
-      style={{
-        width: '40px',
-        height: '40px',
-        border: `3px solid ${isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)'}`,
-        borderTopColor: isDark ? '#fff' : '#000',
-        borderRadius: '50%',
-        animation: 'spin 1s linear infinite',
-      }}
-    />
-  </div>
-);
+  },
+});
 
 export const Navigation = () => {
   const { user, loading } = useAuth();
-  const { isDark } = useTheme();
+  const { colors } = useTheme();
   const [isInitialLoading, setIsInitialLoading] = React.useState(true);
 
   // Reset initial loading after first render
@@ -108,34 +102,34 @@ export const Navigation = () => {
 
   // Show loading screen during initial load
   if (isInitialLoading) {
-    return <LoadingScreen isDark={isDark} />;
+    return <LoadingScreen backgroundColor={colors.paper} accentColor={colors.accent} />;
   }
 
   return (
     <NavigationContainer>
-      <Stack.Navigator 
-        screenOptions={{ 
+      <Stack.Navigator
+        screenOptions={{
           headerShown: false,
-          cardStyle: { backgroundColor: isDark ? '#000' : '#fff' },
+          cardStyle: { backgroundColor: colors.paper },
           // This ensures smooth transitions between auth states
           animationEnabled: false,
         }}
       >
         {user ? (
-          <Stack.Screen 
-            name="Main" 
-            component={MainTabs} 
+          <Stack.Screen
+            name="Main"
+            component={MainTabs}
             options={{
               // Prevent going back to auth screen
               gestureEnabled: false,
             }}
           />
         ) : (
-          <Stack.Screen 
-            name="Auth" 
-            component={AuthScreen} 
+          <Stack.Screen
+            name="Auth"
+            component={AuthScreen}
             options={{
-              cardStyle: { backgroundColor: isDark ? '#000' : '#fff' },
+              cardStyle: { backgroundColor: colors.paper },
               // Prevent going back to main screen when logged out
               gestureEnabled: false,
             }}

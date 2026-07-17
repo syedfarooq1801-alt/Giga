@@ -8,7 +8,7 @@ export const PERSONALITIES: { [key: string]: PersonalityType } = {
     name: 'Swag Bhai',
     description: 'Cool and trendy with a dash of attitude',
     icon: 'sunglasses',
-    color: '#FF9800',
+    color: '#b8790e',
     emoji: '😎',
   },
   ceo_bhai: {
@@ -16,7 +16,7 @@ export const PERSONALITIES: { [key: string]: PersonalityType } = {
     name: 'CEO Bhai',
     description: 'Professional and business-minded advice',
     icon: 'briefcase',
-    color: '#2196F3',
+    color: '#34586F',
     emoji: '💼',
   },
   roast_bhai: {
@@ -24,7 +24,7 @@ export const PERSONALITIES: { [key: string]: PersonalityType } = {
     name: 'Roast Bhai',
     description: 'Witty and humorous with a touch of sarcasm',
     icon: 'fire',
-    color: '#F44336',
+    color: '#B23A22',
     emoji: '🔥',
   },
   vidhyarthi_bhai: {
@@ -32,7 +32,7 @@ export const PERSONALITIES: { [key: string]: PersonalityType } = {
     name: 'Vidhyarthi Bhai',
     description: 'Educational and informative responses',
     icon: 'school',
-    color: '#4CAF50',
+    color: '#6B5590',
     emoji: '📚',
   },
   jugadu_bhai: {
@@ -40,7 +40,7 @@ export const PERSONALITIES: { [key: string]: PersonalityType } = {
     name: 'Jugadu Bhai',
     description: 'Creative problem-solver with resourceful hacks',
     icon: 'tools',
-    color: '#9C27B0',
+    color: '#52702B',
     emoji: '🔧',
   },
 };

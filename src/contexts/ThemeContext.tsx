@@ -1,88 +1,112 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { useColorScheme } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { COLORS_LIGHT, COLORS_DARK, SPACING, RADIUS, TYPOGRAPHY } from '../theme/tokens';
 
-// Define your color palettes
+// Color palettes, remapped onto the "Saaf Baat" token system.
+// Every existing key name is kept so nothing else in the app breaks —
+// new code should prefer the clean token-named keys added at the bottom
+// of each palette (paper/surface/ink/sub/line/accent/...).
 const lightColors = {
-  background: '#FFFFFF',
-  backgroundSecondary: '#F5F6FA',
-  backgroundTertiary: '#E5E7EB',
-  text: '#000000',
-  textSecondary: '#4B5563',
-  textTertiary: '#6B7280',
-  textInverted: '#FFFFFF',
-  primary: '#1a365d',
-  primaryLight: '#3B82F6',
-  primaryDark: '#0F172A',
-  botMessageBackground: '#F0F0F0',
-  userMessageBackground: '#1a365d',
-  botMessageText: '#000000',
-  userMessageText: '#FFFFFF',
-  timestamp: '#666666',
-  inputContainer: '#ECECEC',
-  inputBorder: '#C0C0C0',
-  input: '#000000',
-  card: '#FFFFFF',
-  border: '#E5E7EB',
-  borderLight: '#D1D5DB',
-  notification: '#3B82F6',
-  success: '#10B981',
-  error: '#EF4444',
-  warning: '#F59E0B',
-  info: '#3B82F6',
+  background: COLORS_LIGHT.paper,
+  backgroundSecondary: COLORS_LIGHT.surface,
+  backgroundTertiary: COLORS_LIGHT.surface,
+  text: COLORS_LIGHT.ink,
+  textSecondary: COLORS_LIGHT.sub,
+  textTertiary: COLORS_LIGHT.sub,
+  textInverted: COLORS_LIGHT.paper,
+  primary: COLORS_LIGHT.accent,
+  primaryLight: COLORS_LIGHT.accent,
+  primaryDark: COLORS_LIGHT.accent,
+  botMessageBackground: COLORS_LIGHT.surface,
+  userMessageBackground: COLORS_LIGHT.ink,
+  botMessageText: COLORS_LIGHT.ink,
+  userMessageText: COLORS_LIGHT.paper,
+  timestamp: COLORS_LIGHT.sub,
+  inputContainer: COLORS_LIGHT.surface,
+  inputBorder: COLORS_LIGHT.line,
+  input: COLORS_LIGHT.ink,
+  card: COLORS_LIGHT.surface,
+  border: COLORS_LIGHT.line,
+  borderLight: COLORS_LIGHT.line,
+  notification: COLORS_LIGHT.accent,
+  success: COLORS_LIGHT.success,
+  error: COLORS_LIGHT.danger,
+  warning: COLORS_LIGHT.warning,
+  info: COLORS_LIGHT.accent,
   dropdown: {
-    background: '#FFFFFF',
-    border: '#CCCCCC',
-    text: '#000000',
+    background: COLORS_LIGHT.surface,
+    border: COLORS_LIGHT.line,
+    text: COLORS_LIGHT.ink,
   },
-  disabled: '#A0A0A0',
+  disabled: COLORS_LIGHT.sub,
+  // Deprecated — nothing reads these today, kept only to avoid breaking any future accidental use.
   personalitySwag: '#3B82F6',
   personalityRoast: '#EF4444',
   personalityMotivational: '#10B981',
   personalityFriendly: '#F59E0B',
   personalityProfessional: '#8B5CF6',
   personalityJugadu: '#F97316',
+  // Clean token-named keys — prefer these in new code.
+  paper: COLORS_LIGHT.paper,
+  surface: COLORS_LIGHT.surface,
+  ink: COLORS_LIGHT.ink,
+  sub: COLORS_LIGHT.sub,
+  line: COLORS_LIGHT.line,
+  accent: COLORS_LIGHT.accent,
+  accentContrast: COLORS_LIGHT.accentContrast,
+  danger: COLORS_LIGHT.danger,
+  dangerBg: COLORS_LIGHT.dangerBg,
 };
 
 const darkColors = {
-  background: '#121212',
-  backgroundSecondary: '#1E293B',
-  backgroundTertiary: '#334155',
-  text: '#FFFFFF',
-  textSecondary: '#94A3B8',
-  textTertiary: '#64748B',
-  textInverted: '#0F172A',
-  primary: '#1a365d',
-  primaryLight: '#3B82F6',
-  primaryDark: '#0F172A',
-  botMessageBackground: '#333333',
-  userMessageBackground: '#1a365d',
-  botMessageText: '#FFFFFF',
-  userMessageText: '#FFFFFF',
-  timestamp: '#AAAAAA',
-  inputContainer: '#3C3C3C',
-  inputBorder: '#505050',
-  input: '#FFFFFF',
-  card: '#1E293B',
-  border: '#334155',
-  borderLight: '#475569',
-  notification: '#3B82F6',
-  success: '#10B981',
-  error: '#EF4444',
-  warning: '#F59E0B',
-  info: '#3B82F6',
+  background: COLORS_DARK.paper,
+  backgroundSecondary: COLORS_DARK.surface,
+  backgroundTertiary: COLORS_DARK.surface,
+  text: COLORS_DARK.ink,
+  textSecondary: COLORS_DARK.sub,
+  textTertiary: COLORS_DARK.sub,
+  textInverted: COLORS_DARK.paper,
+  primary: COLORS_DARK.accent,
+  primaryLight: COLORS_DARK.accent,
+  primaryDark: COLORS_DARK.accent,
+  botMessageBackground: COLORS_DARK.surface,
+  userMessageBackground: COLORS_DARK.accent,
+  botMessageText: COLORS_DARK.ink,
+  userMessageText: COLORS_DARK.paper,
+  timestamp: COLORS_DARK.sub,
+  inputContainer: COLORS_DARK.surface,
+  inputBorder: COLORS_DARK.line,
+  input: COLORS_DARK.ink,
+  card: COLORS_DARK.surface,
+  border: COLORS_DARK.line,
+  borderLight: COLORS_DARK.line,
+  notification: COLORS_DARK.accent,
+  success: COLORS_DARK.success,
+  error: COLORS_DARK.danger,
+  warning: COLORS_DARK.warning,
+  info: COLORS_DARK.accent,
   dropdown: {
-    background: '#2C2C2C',
-    border: '#555555',
-    text: '#FFFFFF',
+    background: COLORS_DARK.surface,
+    border: COLORS_DARK.line,
+    text: COLORS_DARK.ink,
   },
-  disabled: '#555555',
+  disabled: COLORS_DARK.sub,
   personalitySwag: '#3B82F6',
   personalityRoast: '#EF4444',
   personalityMotivational: '#10B981',
   personalityFriendly: '#F59E0B',
   personalityProfessional: '#8B5CF6',
   personalityJugadu: '#F97316',
+  paper: COLORS_DARK.paper,
+  surface: COLORS_DARK.surface,
+  ink: COLORS_DARK.ink,
+  sub: COLORS_DARK.sub,
+  line: COLORS_DARK.line,
+  accent: COLORS_DARK.accent,
+  accentContrast: COLORS_DARK.accentContrast,
+  danger: COLORS_DARK.danger,
+  dangerBg: COLORS_DARK.dangerBg,
 };
 
 export type ColorPaletteType = typeof lightColors;
@@ -94,6 +118,9 @@ interface ThemeContextType {
   colors: ColorPaletteType;
   toggleTheme: () => void;
   isDark: boolean;
+  spacing: typeof SPACING;
+  radius: typeof RADIUS;
+  typography: typeof TYPOGRAPHY;
 }
 
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
@@ -136,7 +163,17 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const currentColors = theme === 'light' ? lightColors : darkColors;
 
   return (
-    <ThemeContext.Provider value={{ theme, colors: currentColors, toggleTheme, isDark: theme === 'dark' }}>
+    <ThemeContext.Provider
+      value={{
+        theme,
+        colors: currentColors,
+        toggleTheme,
+        isDark: theme === 'dark',
+        spacing: SPACING,
+        radius: RADIUS,
+        typography: TYPOGRAPHY,
+      }}
+    >
       {children}
     </ThemeContext.Provider>
   );
@@ -148,4 +185,4 @@ export const useTheme = () => {
     throw new Error('useTheme must be used within a ThemeProvider');
   }
   return context;
-}; 
+};

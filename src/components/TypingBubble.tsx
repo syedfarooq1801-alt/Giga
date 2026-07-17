@@ -1,11 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, Animated } from 'react-native';
-import { useTheme } from '@react-navigation/native';
-
-
+import React, { useEffect, useRef } from 'react';
+import { View, StyleSheet, Animated } from 'react-native';
+import { useTheme } from '../contexts/ThemeContext';
 
 export const TypingBubble: React.FC = () => {
-  const { colors } = useTheme();
+  const { colors, radius } = useTheme();
   const dotScales = [useRef(new Animated.Value(1)).current, useRef(new Animated.Value(1)).current, useRef(new Animated.Value(1)).current];
 
   useEffect(() => {
@@ -31,20 +29,27 @@ export const TypingBubble: React.FC = () => {
   }, []);
 
   return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', maxWidth: '80%', marginVertical: 4, marginHorizontal: 8, justifyContent: 'flex-start' }}>
-      <View style={[styles.container, styles.botContainer, { backgroundColor: colors.primary, minWidth: 48, flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }]}>  
-        {[0, 1, 2].map(i => (
-          <Animated.Text
+    <View style={styles.row}>
+      <View
+        style={[
+          styles.container,
+          {
+            backgroundColor: colors.botMessageBackground,
+            borderTopLeftRadius: radius.lg,
+            borderTopRightRadius: radius.lg,
+            borderBottomRightRadius: radius.lg,
+            borderBottomLeftRadius: radius.sm / 2,
+          },
+        ]}
+      >
+        {[0, 1, 2].map((i) => (
+          <Animated.View
             key={i}
-            style={{
-              transform: [{ scale: dotScales[i] }],
-              color: '#fff',
-              fontSize: 26,
-              marginHorizontal: 2,
-              fontWeight: 'bold',
-            }}>
-            .
-          </Animated.Text>
+            style={[
+              styles.dot,
+              { backgroundColor: colors.sub, transform: [{ scale: dotScales[i] }] },
+            ]}
+          />
         ))}
       </View>
     </View>
@@ -52,18 +57,27 @@ export const TypingBubble: React.FC = () => {
 };
 
 const styles = StyleSheet.create({
-  container: {
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
     maxWidth: '80%',
-    padding: 12,
-    borderRadius: 16,
     marginVertical: 4,
     marginHorizontal: 8,
+    justifyContent: 'flex-start',
+  },
+  container: {
+    minWidth: 52,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
     alignSelf: 'flex-start',
   },
-  botContainer: {
-    alignSelf: 'flex-start',
-  },
-  text: {
-    fontSize: 16,
+  dot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    marginHorizontal: 3,
   },
 });

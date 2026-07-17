@@ -5,7 +5,6 @@ import type { FC } from 'react';
 import { PERSONALITIES, DEFAULT_PERSONALITY_ID } from '../constants/personalities';
 import { useTheme } from '../contexts/ThemeContext';
 import {
-  Animated,
   View,
   Text,
   TextInput,
@@ -21,9 +20,6 @@ import {
 } from 'react-native';
 
 
-// Import the logo image
-const GigaLogo = require('../Giga-logo1.png');
-
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import { StackNavigationProp } from '@react-navigation/stack';
 import { useNavigation } from '@react-navigation/native';
@@ -32,6 +28,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MaterialCommunityIcons, MaterialIcons as Icon } from '@expo/vector-icons';
 import { MessageBubble } from '../components/MessageBubble';
 import { TypingBubble } from '../components/TypingBubble';
+import { ChatHeader } from '../components/chat/ChatHeader';
+import { getPersonaAccent } from '../theme/tokens';
+import { sendMessageToBackendStream } from '../services/chatStream';
 import { getFirestore, collection, query, where, getDocs, addDoc, updateDoc, orderBy, doc, serverTimestamp, setDoc, getDoc, onSnapshot, DocumentData, QueryDocumentSnapshot, limit } from 'firebase/firestore';
 
 // Load messages from Firestore for the given conversation
@@ -212,18 +211,9 @@ const sendMessageToBackendAndGetResponse = async (
     if (!isOnline) {
       throw new Error('No internet connection');
     }
-    // Save the user's message to Firestore
-    const db = getFirestore();
-    const messageData: Omit<ChatMessage, 'id'> = {
-      userId,
-      text,
-      sender: 'user',
-      timestamp: new Date(),
-      personalityId,
-      profileId,
-      conversationId: conversationId === null ? undefined : conversationId
-    };
-    await addDoc(collection(db, 'users', profileId, 'messages'), messageData);
+    // Note: the user's message is already written to Firestore by the caller
+    // (handleSendMessage, under the conversation-scoped path) before this runs —
+    // writing it again here to a flat, unread collection was dead weight.
 
     // Make real API call to backend with Firebase ID token
     const auth = getAuth();
@@ -293,32 +283,6 @@ const createProfileId = (userId: string, provider?: string): string => {
   return `${userId}_${provider}`;
 };
 
-// --- Header Component ---
-interface HeaderProps {
-  onPressConversations: () => void;
-}
-const Header: React.FC<HeaderProps> = ({ onPressConversations }) => {
-  const { isDark } = useTheme();
-  return (
-    <View style={[styles.headerContainer, { backgroundColor: isDark ? '#111' : '#fff', borderBottomColor: isDark ? '#222' : '#eee', flexDirection: 'row', alignItems: 'center' }]}
-    >
-      <TouchableOpacity onPress={onPressConversations} style={styles.conversationsButton}>
-  {/* Hamburger icon: three lines */}
-  <View style={styles.hamburgerIcon}>
-    <View style={styles.hamburgerLine} />
-    <View style={styles.hamburgerLine} />
-    <View style={styles.hamburgerLine} />
-  </View>
-</TouchableOpacity>
-      <Image source={GigaLogo} style={[styles.logo, { backgroundColor: isDark ? '#222' : '#f5f5f5' }]} resizeMode="contain" />
-      <View style={styles.headerTextContainer}>
-        <Text style={[styles.appName, { color: isDark ? '#fff' : '#222' }]}>Giga BhAI</Text>
-        <Text style={[styles.tagline, { color: isDark ? '#aaa' : '#666' }]}>Desi dimaagGiga level swag</Text>
-      </View>
-    </View>
-  );
-};
-
 // Main ChatScreen component
 const ChatScreen = () => {
   const { colors, isDark } = useTheme();
@@ -336,32 +300,11 @@ const ChatScreen = () => {
   const [isOnline, setIsOnline] = useState(true);
   const [profileId, setProfileId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
-  const [showPersonalityModal, setShowPersonalityModal] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const { session, loading: authLoading } = useAuth();
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const navigation = useNavigation<StackNavigationProp<RootStackParamList, 'Chat'>>();
   const flatListRef = useRef<any>(null);
-  // Drawer state
-  const [drawerVisible, setDrawerVisible] = useState(false);
-  const drawerAnim = useRef(new Animated.Value(-280)).current;
-
-  // Drawer open/close
-  const openDrawer = () => {
-    setDrawerVisible(true);
-    Animated.timing(drawerAnim, {
-      toValue: 0,
-      duration: 250,
-      useNativeDriver: false,
-    }).start();
-  };
-  const closeDrawer = () => {
-    Animated.timing(drawerAnim, {
-      toValue: -280,
-      duration: 200,
-      useNativeDriver: false,
-    }).start(() => setDrawerVisible(false));
-  };
 
   // Set up network listener
   useEffect(() => {
@@ -417,18 +360,6 @@ const ChatScreen = () => {
       setUserId(session.user.uid);
       console.log('Profile ID set:', session.profileId, 'User ID set:', session.user.uid);
       restoreLastConversation(session.profileId);
-      // Debug: Print all messages for this profileId
-      const debugPrintAllMessages = async (profileId: string) => {
-        try {
-          const db = getFirestore();
-          const messagesSnapshot = await getDocs(collection(db, 'users', profileId, 'messages'));
-          const allMessages = messagesSnapshot.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() }));
-          console.log('[ChatScreen][DEBUG] All messages for profile', profileId, allMessages);
-        } catch (err) {
-          console.error('[ChatScreen][DEBUG] Error fetching all messages for profile:', profileId, err);
-        }
-      };
-      debugPrintAllMessages(session.profileId);
     } else if (!authLoading && !session) {
       setProfileId(null);
       setUserId(null);
@@ -599,7 +530,78 @@ const ChatScreen = () => {
       // Mark this message as processed to prevent duplicates
       processedMessageIds.current.add(userMessage.id);
 
-      // Send to backend and get AI response
+      // Send to backend and get AI response.
+      // Web: stream the reply in sentence chunks. Native: wait for the full
+      // response (RN's fetch doesn't reliably support ReadableStream yet).
+      if (Platform.OS === 'web') {
+        const streamId = `stream-${Date.now()}`;
+        const userTs = userMessage.timestamp instanceof Date
+          ? userMessage.timestamp.getTime()
+          : new Date(userMessage.timestamp).getTime();
+        const streamPlaceholder: ChatMessage = {
+          id: streamId,
+          text: '',
+          userId: 'ai',
+          sender: 'assistant',
+          timestamp: new Date(userTs + 1),
+          personalityId: selectedPersonality.id,
+          profileId,
+          conversationId: convId,
+        };
+        let firstChunkReceived = false;
+
+        try {
+          const streamResult = await sendMessageToBackendStream(
+            userMessage.text,
+            selectedPersonality.id,
+            profileId,
+            convId,
+            userId,
+            (chunk) => {
+              if (!firstChunkReceived) {
+                firstChunkReceived = true;
+                setIsTyping(false);
+                setMessages(prev => [...prev, streamPlaceholder]);
+              }
+              setMessages(prev =>
+                prev.map(msg => (msg.id === streamId ? { ...msg, text: msg.text + chunk } : msg))
+              );
+            }
+          );
+
+          setIsTyping(false);
+
+          if (streamResult) {
+            const finalText = streamResult.fullText || 'Sorry, the AI could not generate a response.';
+            setMessages(prev => {
+              const withoutPlaceholder = prev.filter(msg => msg.id !== streamId);
+              return [...withoutPlaceholder, { ...streamPlaceholder, text: finalText }];
+            });
+            processedMessageIds.current.add(streamId);
+
+            if (streamResult.conversationId && streamResult.conversationId !== convId) {
+              conversationToUse = { ...conversationToUse, id: streamResult.conversationId };
+              setCurrentConversation(conversationToUse);
+            }
+            if (currentConversation) {
+              setCurrentConversation({
+                ...currentConversation,
+                lastMessage: finalText,
+                timestamp: streamPlaceholder.timestamp,
+                personalityId: selectedPersonality.id,
+              });
+            }
+          }
+        } catch (streamError) {
+          console.error('Error streaming message:', streamError);
+          setIsTyping(false);
+          setMessages(prev => prev.filter(msg => msg.id !== streamId));
+          Alert.alert('Error', 'Failed to send message. Please check your connection and try again.');
+        }
+
+        return;
+      }
+
       const backendResult = await sendMessageToBackendAndGetResponse(
         userMessage.text,
         selectedPersonality.id,
@@ -660,7 +662,7 @@ const ChatScreen = () => {
           };
           setCurrentConversation(updatedConv);
         }
-        
+
         // Stop the typing indicator as soon as we've processed the AI message
         setIsTyping(false);
       }
@@ -1274,159 +1276,154 @@ const ChatScreen = () => {
     }
   };
 
-  // Handle personality selection
+  // Handle personality selection — changes the persona for the *next* message
+  // in the current/new conversation (doesn't start a new conversation).
   const handlePersonalitySelect = (personality: PersonalityType) => {
     setSelectedPersonality(personality);
-    setShowPersonalityModal(false);
-    // Optionally, start a new conversation when personality changes, or clear messages
-    // For now, it just changes the personality for the *next* message in current/new conversation
-    // Consider if changing personality should imply a new conversation context:
-    // setCurrentConversation(null); 
-    // setMessages([]);
-    // createNewConversation();
   };
+
+  const accentColor = getPersonaAccent(selectedPersonality.id, isDark);
 
   const styles = StyleSheet.create({
     container: {
       flex: 1,
-      backgroundColor: colors.background
-    },
-    conversationsButton: {
-      padding: 8,
-      marginRight: 8,
-      marginLeft: 4,
-      justifyContent: 'center',
-      alignItems: 'center',
+      backgroundColor: colors.paper,
     },
     networkStatusBar: {
-      backgroundColor: colors.notification, // Or a specific color for offline
+      backgroundColor: colors.dangerBg,
       padding: 8,
-      alignItems: 'center'
+      alignItems: 'center',
     },
     networkStatusText: {
-      color: colors.card // Or a contrasting color
+      color: colors.danger,
+      fontSize: 13,
     },
     messageList: {
       flex: 1,
-      paddingHorizontal: 10
+      paddingHorizontal: 10,
     },
     inputContainer: {
       flexDirection: 'row',
       alignItems: 'center',
       padding: 10,
       borderTopWidth: 1,
-      borderTopColor: colors.border,
-      backgroundColor: colors.card
+      borderTopColor: colors.line,
+      backgroundColor: colors.paper,
     },
     input: {
       flex: 1,
       minHeight: 40,
-      maxHeight: 120, // Allow multiline input up to a certain height
-      paddingHorizontal: 12,
-      paddingVertical: 8,
-      backgroundColor: colors.background, // Input field background
-      borderRadius: 20,
+      maxHeight: 120,
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      backgroundColor: colors.surface,
+      borderRadius: 999,
       marginHorizontal: 8,
-      color: colors.text,
-      fontSize: 16
+      color: colors.ink,
+      fontSize: 15,
     },
     sendButton: {
-      padding: 10,
+      width: 40,
+      height: 40,
       borderRadius: 20,
-      backgroundColor: colors.background
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: accentColor,
     },
     sendButtonDisabled: {
-      backgroundColor: colors.border // A more muted color for disabled state
+      backgroundColor: colors.line,
     },
     micButton: {
-      width: 50,
-      height: 50,
-      borderRadius: 25,
-      backgroundColor: colors.background,
+      width: 40,
+      height: 40,
+      borderRadius: 20,
+      backgroundColor: colors.surface,
       justifyContent: 'center',
       alignItems: 'center',
-      marginLeft: 5,
-      marginRight: 8
+      marginLeft: 4,
+      marginRight: 6,
+    },
+    micButtonActive: {
+      backgroundColor: accentColor,
+    },
+    micButtonDisabled: {
+      opacity: 0.5,
     },
     stopButton: {
-      backgroundColor: colors.primary,
+      backgroundColor: colors.danger,
     },
     stopIcon: {
-      width: 20,
-      height: 20,
-      backgroundColor: '#fff',
+      width: 18,
+      height: 18,
+      backgroundColor: colors.paper,
       justifyContent: 'center',
       alignItems: 'center',
-      borderRadius: 2,
+      borderRadius: 3,
     },
     stopIconInner: {
-      width: 12,
-      height: 12,
-      backgroundColor: '#ff4d4f',
-      borderRadius: 1,
-    },
-    personalityButton: {
-      padding: 10
-    },
-    modalContainer: {
-      flex: 1,
-      justifyContent: 'flex-end', // Aligns modal to bottom or 'center' for middle
-      backgroundColor: 'rgba(0,0,0,0.5)' // Semi-transparent overlay
+      width: 10,
+      height: 10,
+      backgroundColor: colors.danger,
+      borderRadius: 2,
     },
     modalOverlay: {
       flex: 1,
       justifyContent: 'flex-end',
+      backgroundColor: 'rgba(0,0,0,0.4)',
     },
     modalContent: {
-      backgroundColor: colors.card,
+      backgroundColor: colors.paper,
       padding: 20,
       borderTopLeftRadius: 20,
       borderTopRightRadius: 20,
-      maxHeight: '80%' // Limit height for personality/history list
+      maxHeight: '80%',
     },
     modalTitle: {
-      fontSize: 20,
-      fontWeight: 'bold',
-      color: colors.text,
+      fontSize: 18,
+      fontWeight: '800',
+      color: colors.ink,
       marginBottom: 16,
-      textAlign: 'center'
+      textAlign: 'center',
     },
     personalityItem: {
       flexDirection: 'row',
       alignItems: 'center',
       padding: 12,
-      borderRadius: 12,
+      borderRadius: 14,
       marginBottom: 8,
-      backgroundColor: colors.background // Slightly different from modalContent for contrast
+      backgroundColor: colors.surface,
+    },
+    personalityItemActive: {
+      backgroundColor: colors.surface,
+      borderWidth: 2,
+      borderColor: accentColor,
     },
     personalityInfo: {
       flex: 1,
-      marginLeft: 12
+      marginLeft: 12,
     },
     personalityName: {
-      fontSize: 16,
-      fontWeight: '600',
-      color: colors.text,
-      marginBottom: 4
+      fontSize: 15,
+      fontWeight: '700',
+      color: colors.ink,
+      marginBottom: 2,
     },
     personalityDesc: {
-      fontSize: 14,
-      color: colors.text,
-      opacity: 0.8
+      fontSize: 13,
+      color: colors.sub,
     },
     emptyText: {
-      color: colors.text,
+      color: colors.sub,
       textAlign: 'center',
       marginTop: 20,
-      fontSize: 16,
-      opacity: 0.7
+      fontSize: 15,
     },
     loadingContainer: {
       ...StyleSheet.absoluteFillObject,
       justifyContent: 'center',
       alignItems: 'center',
-      backgroundColor: 'rgba(0,0,0,0.1)'
-    }
+      backgroundColor: 'rgba(0,0,0,0.1)',
+    },
   });
 
   if (authLoading) {
@@ -1463,13 +1460,18 @@ const ChatScreen = () => {
         enabled: true,
       } : {})}
     >
-      <Header onPressConversations={() => setShowHistoryModal(true)} />
+      <ChatHeader
+        onPressConversations={() => setShowHistoryModal(true)}
+        personalities={Object.values(PERSONALITIES)}
+        selectedPersonality={selectedPersonality}
+        onSelectPersonality={handlePersonalitySelect}
+        isDefaultPersonality={selectedPersonality.id === DEFAULT_PERSONALITY_ID}
+      />
       {!isOnline && (
         <View style={styles.networkStatusBar}>
           <Text style={styles.networkStatusText}>You are offline. Some features may be limited.</Text>
         </View>
       )}
-      {console.log('Rendering messages:', messages.map(m => ({ id: m.id, sender: m.sender, ts: m.timestamp, text: m.text })))}
       <FlatList
         ref={flatListRef}
         data={isTyping ? [...messages, { id: 'typing-indicator', text: '', sender: 'assistant' as const, personalityId: selectedPersonality.id || 'default', userId: 'ai', timestamp: new Date(), conversationId: currentConversation?.id || '', profileId: profileId || '' }] : messages}
@@ -1493,6 +1495,7 @@ const ChatScreen = () => {
               text={item.text}
               sender={item.sender}
               personalityEmoji={item.sender === 'assistant' && PERSONALITIES[item.personalityId || 'default']?.emoji ? PERSONALITIES[item.personalityId || 'default'].emoji : undefined}
+              accentColor={accentColor}
             />
           );
         }}
@@ -1526,16 +1529,6 @@ const ChatScreen = () => {
         windowSize={21}
       />
       <View style={[styles.inputContainer, { marginBottom: Platform.OS === 'ios' ? 8 : Platform.OS === 'android' ? 4 : 0 }]}>
-        <TouchableOpacity
-          style={styles.personalityButton}
-          onPress={() => setShowPersonalityModal(true)}
-        >
-          <MaterialCommunityIcons
-            name={selectedPersonality.icon as any} // Cast as any if icon names are not strictly typed
-            size={24}
-            color={selectedPersonality.color}
-          />
-        </TouchableOpacity>
         <TextInput
           style={[styles.input, { minHeight: 40, maxHeight: 120 }]}
           value={inputText}
@@ -1570,8 +1563,8 @@ const ChatScreen = () => {
           ) : (
             <Icon
               name={isListening ? 'stop' : 'mic'}
-              size={24}
-              color={isTyping ? '#999' : (isListening ? '#fff' : colors.primary)}
+              size={20}
+              color={isTyping ? colors.sub : isListening ? colors.accentContrast : colors.ink}
             />
           )}
         </TouchableOpacity>
@@ -1584,44 +1577,10 @@ const ChatScreen = () => {
           }}
           disabled={!inputText.trim() || isTyping || isLoadingMessages || !currentConversation}
         >
-          <MaterialCommunityIcons name="send" size={24} color="#fff" />
+          <MaterialCommunityIcons name="send" size={20} color={colors.accentContrast} />
         </TouchableOpacity>
       </View>
 
-      <Modal
-        visible={showPersonalityModal}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setShowPersonalityModal(false)}
-      >
-        <Pressable
-          style={styles.modalOverlay}
-          onPress={() => setShowPersonalityModal(false)} // Close when overlay is pressed
-        >
-          <Pressable style={styles.modalContent}> {/* Prevent closing when content is pressed */}
-            <Text style={styles.modalTitle}>Choose Personality</Text>
-            <FlatList<PersonalityType>
-              data={Object.values(PERSONALITIES)}
-              keyExtractor={(item: PersonalityType) => item.id}
-              renderItem={({ item }: { item: PersonalityType }) => (
-                <TouchableOpacity
-                  key={item.id}
-                  style={styles.personalityItem}
-                  onPress={() => handlePersonalitySelect(item)}
-                >
-                  <MaterialCommunityIcons name={item.icon as any} size={24} color={item.color} />
-                  <View style={styles.personalityInfo}>
-                    <Text style={styles.personalityName}>{item.name}</Text>
-                    <Text style={styles.personalityDesc}>{String(item.description || "")}</Text>
-                  </View>
-                </TouchableOpacity>
-              )}
-            />
-          </Pressable>
-        </Pressable>
-      </Modal>
-
-      {/* History Modal - TODO: Implement fully */}
       <Modal
         visible={showHistoryModal}
         transparent
@@ -1635,10 +1594,7 @@ const ChatScreen = () => {
           <Pressable style={styles.modalContent}>
             <Text style={styles.modalTitle}>Conversation History</Text>
             <TouchableOpacity
-              style={[
-                styles.personalityItem,
-                { backgroundColor: messages.length === 0 ? '#ccc' : '#e0e0e0', marginBottom: 8, opacity: messages.length === 0 ? 0.6 : 1 }
-              ]}
+              style={[styles.personalityItem, { opacity: messages.length === 0 ? 0.5 : 1 }]}
               disabled={messages.length === 0}
               onPress={async () => {
                 if (messages.length === 0) return;
@@ -1649,7 +1605,7 @@ const ChatScreen = () => {
                 }
               }}
             >
-              <MaterialCommunityIcons name="plus" size={24} color={messages.length === 0 ? '#aaa' : '#3a86ff'} />
+              <MaterialCommunityIcons name="plus" size={22} color={messages.length === 0 ? colors.sub : accentColor} />
               <View style={styles.personalityInfo}>
                 <Text style={styles.personalityName}>
                   {messages.length === 0 ? 'Finish current conversation to start new' : 'Start New Conversation'}
@@ -1661,18 +1617,18 @@ const ChatScreen = () => {
               keyExtractor={(item: Conversation) => item.id}
               renderItem={({ item }: { item: Conversation }) => (
                 <TouchableOpacity
-                  style={[styles.personalityItem, currentConversation?.id === item.id && { backgroundColor: '#d0ebff' }]}
+                  style={[styles.personalityItem, currentConversation?.id === item.id && styles.personalityItemActive]}
                   onPress={() => {
                     setCurrentConversation(item);
                     setShowHistoryModal(false);
                   }}
                 >
-                  <MaterialCommunityIcons name="message-text" size={24} color="#888" />
+                  <MaterialCommunityIcons name="message-text-outline" size={22} color={colors.sub} />
                   <View style={styles.personalityInfo}>
                     <Text style={styles.personalityName} numberOfLines={1}>{item.title}</Text>
                     <Text style={styles.personalityDesc} numberOfLines={1}>{item.lastMessage || 'No messages yet.'}</Text>
                   </View>
-                  <Text style={{ fontSize: 12, color: '#999', marginLeft: 'auto' }}>{formatTimestamp(item.timestamp)}</Text>
+                  <Text style={{ fontSize: 11, color: colors.sub, marginLeft: 'auto' }}>{formatTimestamp(item.timestamp)}</Text>
                 </TouchableOpacity>
               )}
               ListEmptyComponent={<Text style={styles.emptyText}>No conversations yet.</Text>}
@@ -1688,221 +1644,5 @@ const ChatScreen = () => {
     </Container>
   );
 };
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    minHeight: 0,
-    minWidth: 0,
-    backgroundColor: '#fff', // Ensure background is never transparent
-  },
-  networkStatusBar: {
-    backgroundColor: '#f8d7da',
-    padding: 6,
-    alignItems: 'center',
-  },
-  networkStatusText: {
-    color: '#721c24',
-  },
-  messageList: {
-    flex: 1,
-    paddingHorizontal: 16,
-    paddingBottom: 12,
-  },
-  inputContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingBottom: 12,
-    borderTopWidth: 1,
-  },
-  input: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#eee',
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    fontSize: 16,
-    marginRight: 8,
-    backgroundColor: '#f9f9f9',
-  },
-  sendButton: {
-    backgroundColor: '#3a86ff',
-    borderRadius: 20,
-    padding: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sendButtonDisabled: {
-    backgroundColor: '#b0c4de',
-  },
-  micButton: {
-    width: 50,
-    height: 50,
-    borderRadius: 25,
-    backgroundColor: '#3a86ff',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: 6,
-    marginRight: 4,
-  },
-  stopButton: {
-    backgroundColor: '#ff4d4f',
-  },
-  stopIcon: {
-    width: 20,
-    height: 20,
-    backgroundColor: '#fff',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderRadius: 2,
-  },
-  stopIconInner: {
-    width: 12,
-    height: 12,
-    backgroundColor: '#ff4d4f',
-    borderRadius: 1,
-  },
-  personalityButton: {
-    marginLeft: 8,
-    padding: 8,
-    borderRadius: 16,
-    backgroundColor: '#eee',
-  },
-  modalContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.3)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalContent: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 24,
-    minWidth: 300,
-    alignItems: 'center',
-  },
-  modalTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 12,
-  },
-  personalityItem: {
-    padding: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-    width: '100%',
-  },
-  personalityInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  personalityName: {
-    fontWeight: 'bold',
-    fontSize: 16,
-  },
-  personalityDesc: {
-    fontSize: 13,
-    color: '#666',
-    marginLeft: 8,
-  },
-  emptyText: {
-    color: '#aaa',
-    fontStyle: 'italic',
-    marginTop: 16,
-    textAlign: 'center',
-  },
-  loadingContainer: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(255,255,255,0.7)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 10,
-  },
-  // Header styles
-  headerContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-    borderBottomWidth: 1,
-    marginBottom: 8,
-  },
-  logo: {
-    width: 64, // Increased size
-    height: 64, // Increased size
-    marginRight: 20,
-    borderRadius: 16,
-  },
-  headerTextContainer: {
-    flexDirection: 'column',
-    justifyContent: 'center',
-  },
-  appName: {
-    fontSize: 24, // Slightly bigger
-    fontWeight: 'bold',
-    letterSpacing: 1,
-  },
-  tagline: {
-    fontSize: 14,
-    marginTop: 2,
-    fontStyle: 'italic',
-  },
-  conversationsButton: {
-    backgroundColor: 'transparent',
-    paddingVertical: 8,
-    paddingHorizontal: 8,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginLeft: 0,
-  },
-  hamburgerIcon: {
-    width: 28,
-    height: 28,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  hamburgerLine: {
-    width: 22,
-    height: 3,
-    backgroundColor: '#3a86ff',
-    marginVertical: 2,
-    borderRadius: 2,
-  },
-  drawerOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.3)',
-    flexDirection: 'row',
-  },
-  drawerContainer: {
-    width: 280,
-    height: '100%',
-    backgroundColor: '#fff',
-    paddingTop: 48,
-    paddingHorizontal: 16,
-    shadowColor: '#000',
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 8,
-    position: 'absolute',
-    left: 0,
-    top: 0,
-    bottom: 0,
-    zIndex: 100,
-  },
-  drawerTitle: {
-    fontWeight: 'bold',
-    fontSize: 20,
-    marginBottom: 16,
-  },
-  // Add any additional styles below this line if needed
-});
 
 export default ChatScreen;

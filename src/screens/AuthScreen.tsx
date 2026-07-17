@@ -11,7 +11,7 @@ type AuthScreenProps = {
 };
 
 const AuthScreen = ({ navigation }: AuthScreenProps) => {
-  const { isDark } = useTheme();
+  const { colors } = useTheme();
   const { user, loading } = useAuth();
 
   // Simple redirect if user is already logged in
@@ -26,14 +26,14 @@ const AuthScreen = ({ navigation }: AuthScreenProps) => {
 
   if (loading) {
     return (
-      <View style={[styles.container, styles.loadingContainer, { backgroundColor: isDark ? '#000' : '#fff' }]}>
-        <ActivityIndicator size="large" color={isDark ? '#fff' : '#000'} />
+      <View style={[styles.container, styles.loadingContainer, { backgroundColor: colors.paper }]}>
+        <ActivityIndicator size="large" color={colors.accent} />
       </View>
     );
   }
 
   return (
-    <View style={[styles.container, { backgroundColor: isDark ? '#000' : '#fff' }]}>
+    <View style={[styles.container, { backgroundColor: colors.paper }]}>
       <EmailAuthScreen />
     </View>
   );

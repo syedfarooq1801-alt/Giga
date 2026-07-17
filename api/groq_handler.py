@@ -1,7 +1,9 @@
 import httpx
 import asyncio
+import json
 import time
 import logging
+from typing import AsyncGenerator
 from config import GROQ_API_KEY, GROQ_API_URL
 
 async def get_groq_response(messages: list):
@@ -98,3 +100,71 @@ async def get_groq_response(messages: list):
                 return f"An error occurred: {str(e)}"
             await asyncio.sleep(delay)
             delay = min(delay * 2, 5.0)  # Cap the delay at 5 seconds
+
+
+async def get_groq_response_stream(messages: list) -> AsyncGenerator[str, None]:
+    """
+    Sibling to get_groq_response() that yields content deltas as they arrive
+    from Groq's SSE stream, instead of waiting for one complete response.
+    Kept separate (rather than adding a stream=True branch to the function
+    above) so /mistral-heading and /groq-heading keep using the proven
+    non-streaming path unchanged.
+    """
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    final_messages = []
+    system_messages = [msg for msg in messages if msg.get('role') == 'system']
+    if system_messages:
+        system_content = "\n".join([msg.get('content', '') for msg in system_messages if msg.get('content')])
+        final_messages.append({"role": "system", "content": system_content})
+    conversation_messages = [msg for msg in messages if msg.get('role') != 'system']
+    final_messages.extend(conversation_messages)
+
+    input_text = ' '.join([msg.get('content', '') for msg in final_messages])
+    estimated_input_tokens = len(input_text) // 2
+    max_allowed_tokens = 8000
+    max_tokens = min(2048, max(100, max_allowed_tokens - estimated_input_tokens))
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": final_messages,
+        "temperature": 0.7,
+        "max_tokens": max_tokens,
+        "top_p": 0.9,
+        "frequency_penalty": 0.5,
+        "presence_penalty": 0.5,
+        "stream": True,
+    }
+
+    logger = logging.getLogger("groq_handler")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream("POST", GROQ_API_URL, headers=headers, json=payload) as response:
+                if response.status_code != 200:
+                    error_body = await response.aread()
+                    logger.error(f"Groq stream API error {response.status_code}: {error_body!r}")
+                    return
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[len("data: "):].strip()
+                    if data == "[DONE]":
+                        return
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+    except Exception as e:
+        logger.error(f"Error in get_groq_response_stream: {str(e)}", exc_info=True)
+        return
