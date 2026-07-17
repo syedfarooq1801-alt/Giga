@@ -1608,6 +1608,24 @@ async def upload_document_endpoint(file: UploadFile = File(...), current_user: d
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ImportError as e:
+        # sentence-transformers/torch are deliberately not in requirements.txt
+        # (too large for a serverless bundle) -- see the comment there. On a
+        # deploy without them installed, this is an EXPECTED gap, not a bug:
+        # it must surface as a clean JSON error, not an unhandled crash (an
+        # unhandled exception here previously returned Vercel's generic HTML
+        # error page, which broke the frontend's response.json() parse with
+        # "Unexpected token 'A', "A server e"... is not valid JSON").
+        logger.error(f"Document upload unavailable -- missing embedding dependency: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Document uploads aren't available on this deployment yet (local embeddings aren't installed here).",
+        )
+    except Exception as e:
+        # Same reasoning as above, generalized: ANY unhandled exception here
+        # must still come back as JSON, never a raw crash.
+        logger.error(f"Unexpected error during document upload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Upload failed unexpectedly. Please try again.")
 
     await add_document_metadata(profile_id, user_id, result["doc_id"], filename, result["chunk_count"])
     return {"success": True, "doc_id": result["doc_id"], "filename": filename, "chunk_count": result["chunk_count"]}
