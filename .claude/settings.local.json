@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp \"/c/Users/Syed Farooq/Downloads/giga-bhai-firebase-adminsdk-fbsvc-1a0779f1d9.json\" \"/c/Users/Syed Farooq/Desktop/Giga/gigabhai-backend/serviceAccountKey.json\" && ls -la \"/c/Users/Syed Farooq/Desktop/Giga/gigabhai-backend/serviceAccountKey.json\")",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(curl -s http://localhost:8000/test-cors)",
+      "Bash(curl -s http://localhost:8000/personalities)",
+      "Bash(curl -s -X POST http://localhost:8000/get-test-token)",
+      "Bash(npm install *)",
+      "Bash(rm -f package-lock.json)"
+    ]
+  }
+}
