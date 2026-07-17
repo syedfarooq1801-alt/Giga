@@ -291,7 +291,7 @@ export const AuthProvider: FC<AuthProviderProps> = ({ children }) => {
       }
       // Fetch and set the profile
       const userProfile = (await getDoc(doc(db, 'profiles', profileId))).data() as UserProfile;
-      setState(prev => ({ ...prev, loading: false, userProfile }));
+      setState(prev => ({ ...prev, loading: false, user, userProfile }));
       return result;
     } catch (error) {
       setState(prev => ({ 
@@ -313,7 +313,14 @@ export const AuthProvider: FC<AuthProviderProps> = ({ children }) => {
       const profileId = createProfileId(user);
       const profileDoc = await getDoc(doc(db, 'profiles', profileId));
       const userProfile = profileDoc.exists() ? profileDoc.data() as UserProfile : null;
-      setState(prev => ({ ...prev, loading: false, userProfile }));
+      // BUG (this is the "have to reload to get logged in" report): this
+      // used to omit `user` here, relying entirely on the separate
+      // onAuthStateChanged listener below to set it. If that listener's own
+      // (independent) Firestore profile fetch resolves AFTER this one, this
+      // call landed last and left state.user at null -- Navigation (which
+      // reads user straight from this context) never switched off the auth
+      // screen until a reload re-ran the listener from scratch.
+      setState(prev => ({ ...prev, loading: false, user, userProfile }));
     } catch (error) {
       setState(prev => ({ 
         ...prev, 
@@ -349,11 +356,11 @@ export const AuthProvider: FC<AuthProviderProps> = ({ children }) => {
       // Fetch and set the profile from Firestore
       const profileDoc = await getDoc(doc(db, 'profiles', profileId));
       const userProfile = profileDoc.exists() ? profileDoc.data() as UserProfile : null;
-      setState(prev => ({ ...prev, loading: false, userProfile }));
+      setState(prev => ({ ...prev, loading: false, user, userProfile }));
     } catch (error) {
-      setState(prev => ({ 
-        ...prev, 
-        loading: false, 
+      setState(prev => ({
+        ...prev,
+        loading: false,
         error: error instanceof Error ? error : new Error('Error signing up with email')
       }));
       throw error;
