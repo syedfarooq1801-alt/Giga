@@ -843,7 +843,7 @@ const ChatScreen = () => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        if (inputText.trim() && currentConversation && !isLoadingMessages) {
+        if (inputText.trim() && !isLoadingMessages) {
           void handleSendMessage(inputText);
         }
       }
@@ -1761,11 +1761,17 @@ const ChatScreen = () => {
           placeholderTextColor={colors.textTertiary}
           multiline
           maxLength={1000}
-          editable={!isLoadingMessages && !!currentConversation}
+          editable={!isLoadingMessages}
           blurOnSubmit={false}
           returnKeyType="send"
           onSubmitEditing={() => {
-            if (inputText.trim() && currentConversation) {
+            // handleSendMessage lazily creates a conversation
+            // (currentConversation ?? createNewConversation()) if none is
+            // selected yet -- gating this on currentConversation already
+            // existing left a brand-new account (zero conversations, so
+            // currentConversation starts null) completely unable to type
+            // or send its first-ever message.
+            if (inputText.trim()) {
               void handleSendMessage(inputText);
             }
           }}
@@ -1793,13 +1799,13 @@ const ChatScreen = () => {
           )}
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.sendButton, (!inputText.trim() || isTyping || isLoadingMessages || !currentConversation) && styles.sendButtonDisabled]}
+          style={[styles.sendButton, (!inputText.trim() || isTyping || isLoadingMessages) && styles.sendButtonDisabled]}
           onPress={() => {
-            if (inputText.trim() && currentConversation) {
+            if (inputText.trim()) {
               void handleSendMessage(inputText);
             }
           }}
-          disabled={!inputText.trim() || isTyping || isLoadingMessages || !currentConversation}
+          disabled={!inputText.trim() || isTyping || isLoadingMessages}
         >
           <MaterialCommunityIcons name="send" size={20} color={colors.accentContrast} />
         </TouchableOpacity>
