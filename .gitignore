@@ -51,3 +51,8 @@ uploads/
 /gigabhai-backend/
 /gigabhai-frontend/
 
+# local dev-only files
+*.log
+api/.env
+api/serviceAccountKey.json
+
