@@ -4,5 +4,3 @@ python-dotenv==1.0.0
 firebase-admin==6.1.0
 httpx==0.24.0
 slowapi==0.1.10
-pytest==7.4.3
-pytest-asyncio==0.21.1
