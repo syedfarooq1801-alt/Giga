@@ -204,6 +204,7 @@ const ChatScreen = () => {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const navigation = useNavigation<StackNavigationProp<RootStackParamList, 'Chat'>>();
   const flatListRef = useRef<any>(null);
+  const inputRef = useRef<any>(null);
 
   // Set up network listener
   useEffect(() => {
@@ -652,6 +653,27 @@ const ChatScreen = () => {
       flatListRef.current.scrollToEnd({ animated: true });
     }
   }, [messages]);
+
+  // Web: Enter sends, Shift+Enter inserts a newline. RN's multiline
+  // TextInput maps to a plain <textarea> under react-native-web, and
+  // onSubmitEditing never fires on it there -- Enter just does the
+  // textarea's default (newline). Native keeps the existing
+  // onSubmitEditing/returnKeyType="send" behavior (the soft-keyboard
+  // return key), which already works correctly and doesn't need this.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !inputRef.current) return;
+    const node = inputRef.current as unknown as HTMLTextAreaElement;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (inputText.trim() && currentConversation && !isLoadingMessages) {
+          void handleSendMessage(inputText);
+        }
+      }
+    };
+    node.addEventListener('keydown', handleKeyDown);
+    return () => node.removeEventListener('keydown', handleKeyDown);
+  }, [inputText, currentConversation, isLoadingMessages]);
 
   // Effect to save currentConversation to AsyncStorage whenever it changes
   useEffect(() => {
@@ -1381,6 +1403,7 @@ const ChatScreen = () => {
       />
       <View style={[styles.inputContainer, { marginBottom: Platform.OS === 'ios' ? 8 : Platform.OS === 'android' ? 4 : 0 }]}>
         <TextInput
+          ref={inputRef}
           style={[styles.input, { minHeight: 40, maxHeight: 120 }]}
           value={inputText}
           onChangeText={setInputText}
