@@ -1,4 +1,5 @@
-from typing import List, Dict, Any
+import hashlib
+from typing import List, Dict, Any, Optional
 
 PERSONALITIES = {
     "swag_bhai": {
@@ -122,20 +123,87 @@ You're Jugadu Bhai — a born hacker, fixer, and life-hack wizard.
     },
 }
 
-def get_personality_context(personality_id: str) -> List[Dict[str, Any]]:
-    """Get the context and system prompt for a specific personality."""
+# A/B prompt variants: persona_id -> {variant_name: prompt_text}. "control"
+# is never a key here -- it's the implicit default (PERSONALITY_PROMPTS'
+# existing prompt) and is never looked up in this dict, see
+# get_personality_context(). Personas with no entry here only ever run
+# "control". The eval harness (api/eval/) showed ceo_bhai and
+# vidhyarthi_bhai score lowest on hinglish_quality (their personas read as
+# more formal/professional) -- hinglish_boost is a real hypothesis test of
+# whether nudging more Hindi/Urdu code-switching improves that without
+# breaking their character.
+PROMPT_VARIANTS: Dict[str, Dict[str, str]] = {
+    "ceo_bhai": {
+        "hinglish_boost": """
+You're CEO Bhai — a sharp, confident leader with business instincts.
+- Talk like a decision-maker: crisp, clear, strategic.
+- Drop practical advice, plans, or business insights.
+- Naturally mix in Hindi/Urdu business words and phrases (e.g. "dekho", "bilkul", "paisa vasool", "jugaad", "bhai", "scene kya hai") alongside English — sound like a real desi founder, not a textbook executive.
+- Avoid over-explaining. Get to the point fast.
+- If unsure, say: "Based on experience..." or "Here's what the data suggests..."
+- Always finish with a next step or takeaway.
+- If asked who made you: "Built in June 2025 by Syed Farooq — a future business tycoon in the making!"
+"""
+    },
+    "vidhyarthi_bhai": {
+        "hinglish_boost": """
+You're Vidhyarthi Bhai — a curious, cheerful learner who loves to share knowledge.
+- Break down tough stuff in simple terms.
+- Use examples, facts, or analogies to explain.
+- Naturally mix in Hindi/Urdu words and phrases while explaining (e.g. "samjho", "dekho na", "bilkul", "matlab") — like a real student explaining to a friend, not a textbook.
+- Never say "I don’t know" — say "Here’s what I do know..."
+- Stay positive, clear, and excited about learning.
+- End with a fun fact or a question that makes people think.
+- If asked who made you: "Created in June 2025 by Syed Farooq — my mission is to make learning fun. 📚"
+"""
+    },
+}
+
+
+def get_variant_names(persona_id: str) -> List[str]:
+    """All selectable variant names for a persona -- "control" always
+    first/implicit, plus any named variants from PROMPT_VARIANTS."""
+    return ["control"] + list(PROMPT_VARIANTS.get(persona_id, {}).keys())
+
+
+def assign_variant(persona_id: str, chat_id: str) -> str:
+    """Deterministic variant assignment for a given chat -- same
+    (persona_id, chat_id) always resolves to the same variant, computed
+    in-memory with no I/O. Uses hashlib (not Python's built-in hash(), which
+    is randomized per-process via PYTHONHASHSEED) so assignment is stable
+    across restarts, not just within one running process."""
+    variants = get_variant_names(persona_id)
+    if len(variants) <= 1:
+        return "control"
+    digest = hashlib.sha256(f"{persona_id}:{chat_id}".encode()).hexdigest()
+    return variants[int(digest, 16) % len(variants)]
+
+
+def get_personality_context(personality_id: str, variant: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get the context and system prompt for a specific personality.
+
+    variant selects an alternate prompt from PROMPT_VARIANTS (Phase 2) --
+    None (the default) always uses the standard PERSONALITY_PROMPTS prompt,
+    and an unrecognized variant/persona pair falls back the same way, so
+    this is fully backward-compatible while PROMPT_VARIANTS is still empty.
+    """
     if personality_id not in PERSONALITIES:
         personality_id = "swag_bhai"  # Default to Swag Bhai
-    
+
     personality = PERSONALITIES[personality_id]
     persona_data = PERSONALITY_PROMPTS.get(personality_id, PERSONALITY_PROMPTS["swag_bhai"])
-    
+
+    variant_prompt = None
+    if variant:
+        variant_prompt = PROMPT_VARIANTS.get(personality_id, {}).get(variant)
+
     # Base system prompt with core instructions
     system_prompt = BASE_SYSTEM_PROMPT.format(persona_name=personality["name"])
-    
-    # Combine with personality-specific prompt
-    full_prompt = f"{system_prompt.strip()}\n\n{persona_data['prompt'].strip()}"
-    
+
+    # Combine with personality-specific prompt (or the selected variant)
+    persona_prompt = variant_prompt if variant_prompt else persona_data['prompt']
+    full_prompt = f"{system_prompt.strip()}\n\n{persona_prompt.strip()}"
+
     return [
         {
             "role": "system",

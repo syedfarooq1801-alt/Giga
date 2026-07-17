@@ -56,3 +56,11 @@ uploads/
 api/.env
 api/serviceAccountKey.json
 
+# eval harness run outputs (ephemeral -- baseline.json is the tracked reference point)
+api/eval/results/
+
+# fine-tune generated datasets/venv/model artifacts -- large, regenerable, never committed
+api/finetune/data/
+api/finetune/.venv/
+api/finetune/models/
+

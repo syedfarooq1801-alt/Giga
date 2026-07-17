@@ -12,7 +12,8 @@ import {
   ActivityIndicator,
   Keyboard,
 } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { pickAndUploadDocument, fetchDocumentsList, deleteDocumentById } from '../services/documents';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../contexts/ThemeContext';
 import { useNavigation } from '@react-navigation/native';
@@ -24,6 +25,8 @@ import { PERSONALITIES, DEFAULT_PERSONALITY_ID } from '../constants/personalitie
 import { getPersonaAccent } from '../theme/tokens';
 import { LinearGradient } from 'expo-linear-gradient';
 import Toast from 'react-native-toast-message';
+import { getAuth } from 'firebase/auth';
+import { API_URL } from '../constants';
 
 const APP_VERSION = '0.01';
 const APP_TAGLINE = 'Desi dimaag, Giga level swag';
@@ -40,6 +43,15 @@ export const SettingsScreen: React.FC = () => {
   const [showTerms, setShowTerms] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [showExperiments, setShowExperiments] = useState(false);
+  const [experimentPersona, setExperimentPersona] = useState<string>('ceo_bhai');
+  const [experimentStats, setExperimentStats] = useState<Record<string, any> | null>(null);
+  const [experimentLoading, setExperimentLoading] = useState(false);
+  const [experimentError, setExperimentError] = useState<string | null>(null);
+  const [showDocuments, setShowDocuments] = useState(false);
+  const [documents, setDocuments] = useState<Array<{ doc_id: string; filename: string; chunk_count: number }>>([]);
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [docsUploading, setDocsUploading] = useState(false);
 
   useEffect(() => {
     Keyboard.dismiss();
@@ -133,6 +145,63 @@ export const SettingsScreen: React.FC = () => {
       });
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const fetchExperimentStats = async (personaId: string) => {
+    setExperimentLoading(true);
+    setExperimentError(null);
+    try {
+      const idToken = await getAuth().currentUser?.getIdToken();
+      const res = await fetch(`${API_URL}/api/experiments/${personaId}`, {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        // The backend returns a clear, actionable message here (e.g. a
+        // one-time Firestore index that needs creating) -- surface it
+        // as-is rather than a generic failure.
+        throw new Error(data.detail || `Request failed (${res.status})`);
+      }
+      setExperimentStats(data.variants);
+    } catch (error) {
+      setExperimentStats(null);
+      setExperimentError(error instanceof Error ? error.message : 'Failed to load experiment results.');
+    } finally {
+      setExperimentLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (showExperiments) {
+      fetchExperimentStats(experimentPersona);
+    }
+  }, [showExperiments, experimentPersona]);
+
+  const fetchDocuments = async () => {
+    setDocsLoading(true);
+    setDocuments(await fetchDocumentsList());
+    setDocsLoading(false);
+  };
+
+  useEffect(() => {
+    if (showDocuments) fetchDocuments();
+  }, [showDocuments]);
+
+  const handleUploadDocument = async () => {
+    setDocsUploading(true);
+    const result = await pickAndUploadDocument();
+    setDocsUploading(false);
+    if (result) fetchDocuments();
+  };
+
+  const deleteDocument = async (docId: string) => {
+    const ok = await deleteDocumentById(docId);
+    if (ok) {
+      setDocuments(prev => prev.filter(d => d.doc_id !== docId));
+      Toast.show({ type: 'success', text1: 'Document deleted', position: 'bottom' });
+    } else {
+      Toast.show({ type: 'error', text1: 'Failed to delete document', position: 'bottom' });
     }
   };
 
@@ -265,6 +334,16 @@ export const SettingsScreen: React.FC = () => {
           </View>
         </ScrollView>
 
+        {/* Documents Button */}
+        <TouchableOpacity style={styles.aboutButton} onPress={() => setShowDocuments(true)}>
+          <Text style={styles.aboutButtonText}>Documents</Text>
+        </TouchableOpacity>
+
+        {/* Prompt Experiments Button */}
+        <TouchableOpacity style={styles.aboutButton} onPress={() => setShowExperiments(true)}>
+          <Text style={styles.aboutButtonText}>Prompt Experiments</Text>
+        </TouchableOpacity>
+
         {/* About Button */}
         <TouchableOpacity style={styles.aboutButton} onPress={() => setShowAbout(true)}>
           <Text style={styles.aboutButtonText}>About</Text>
@@ -372,6 +451,126 @@ export const SettingsScreen: React.FC = () => {
           </View>
         </Modal>
 
+        {/* Documents Modal */}
+        <Modal visible={showDocuments} animationType="slide" onRequestClose={() => setShowDocuments(false)}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Documents</Text>
+              <TouchableOpacity onPress={() => setShowDocuments(false)}>
+                <Ionicons name="close" size={24} color={colors.ink} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.modalContent}>
+              <Text style={[styles.saveChatText, { marginBottom: 12 }]}>
+                Upload a .txt or .pdf, then toggle "use my docs" (the document icon next to the chat input) to
+                let the bot answer using it.
+              </Text>
+              <TouchableOpacity
+                style={[styles.submitButton, { opacity: docsUploading ? 0.7 : 1 }]}
+                onPress={handleUploadDocument}
+                disabled={docsUploading}
+              >
+                {docsUploading ? (
+                  <ActivityIndicator color={colors.accentContrast} size="small" />
+                ) : (
+                  <Text style={styles.submitButtonText}>Upload a document</Text>
+                )}
+              </TouchableOpacity>
+
+              {docsLoading && <ActivityIndicator color={colors.accent} style={{ marginTop: 20 }} />}
+
+              {!docsLoading && documents.length === 0 && (
+                <Text style={[styles.saveChatText, { marginTop: 20 }]}>No documents uploaded yet.</Text>
+              )}
+
+              {!docsLoading && documents.map((doc) => (
+                <View key={doc.doc_id} style={styles.documentRow}>
+                  <MaterialCommunityIcons name="file-document-outline" size={20} color={colors.sub} />
+                  <View style={styles.documentInfo}>
+                    <Text style={[styles.personalityText, { color: colors.ink, marginLeft: 0 }]} numberOfLines={1}>
+                      {doc.filename}
+                    </Text>
+                    <Text style={{ fontSize: 12, color: colors.sub }}>{doc.chunk_count} chunk{doc.chunk_count === 1 ? '' : 's'}</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => deleteDocument(doc.doc_id)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <Ionicons name="trash-outline" size={20} color={colors.danger} />
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </ScrollView>
+          </View>
+        </Modal>
+
+        {/* Prompt Experiments Modal */}
+        <Modal visible={showExperiments} animationType="slide" onRequestClose={() => setShowExperiments(false)}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Prompt Experiments</Text>
+              <TouchableOpacity onPress={() => setShowExperiments(false)}>
+                <Ionicons name="close" size={24} color={colors.ink} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.modalContent}>
+              <Text style={[styles.saveChatText, { marginBottom: 12 }]}>
+                Thumbs up/down per prompt variant, across all users, for a persona.
+              </Text>
+              <View style={styles.experimentPersonaRow}>
+                {Object.values(PERSONALITIES).map((p) => (
+                  <TouchableOpacity
+                    key={p.id}
+                    style={[
+                      styles.experimentPersonaChip,
+                      { borderColor: colors.line },
+                      experimentPersona === p.id && { borderColor: colors.accent, backgroundColor: colors.surface },
+                    ]}
+                    onPress={() => setExperimentPersona(p.id)}
+                  >
+                    <Text style={{ fontSize: 16 }}>{p.emoji}</Text>
+                    <Text style={[styles.experimentPersonaText, { color: colors.ink }]}>{p.name}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {experimentLoading && <ActivityIndicator color={colors.accent} style={{ marginTop: 20 }} />}
+
+              {!experimentLoading && experimentError && (
+                <Text style={[styles.termsText, { color: colors.danger, marginTop: 16 }]}>{experimentError}</Text>
+              )}
+
+              {!experimentLoading && !experimentError && experimentStats && Object.keys(experimentStats).length === 0 && (
+                <Text style={[styles.saveChatText, { marginTop: 20 }]}>No messages yet for this persona.</Text>
+              )}
+
+              {!experimentLoading && !experimentError && experimentStats && Object.keys(experimentStats).length > 0 && (
+                <View style={{ marginTop: 16 }}>
+                  <View style={styles.experimentRow}>
+                    <Text style={[styles.experimentHeaderCell, { color: colors.sub, flex: 1.4 }]}>variant</Text>
+                    <Text style={[styles.experimentHeaderCell, { color: colors.sub }]}>n</Text>
+                    <Text style={[styles.experimentHeaderCell, { color: colors.sub }]}>👍</Text>
+                    <Text style={[styles.experimentHeaderCell, { color: colors.sub }]}>👎</Text>
+                    <Text style={[styles.experimentHeaderCell, { color: colors.sub, flex: 1.2 }]}>👍 rate</Text>
+                  </View>
+                  {Object.entries(experimentStats).map(([variant, s]: [string, any]) => (
+                    <View key={variant} style={styles.experimentRow}>
+                      <Text style={[styles.experimentCell, { color: colors.ink, flex: 1.4, fontWeight: '600' }]}>{variant}</Text>
+                      <Text style={[styles.experimentCell, { color: colors.ink }]}>{s.messages}</Text>
+                      <Text style={[styles.experimentCell, { color: colors.ink }]}>{s.thumbs_up}</Text>
+                      <Text style={[styles.experimentCell, { color: colors.ink }]}>{s.thumbs_down}</Text>
+                      <Text style={[styles.experimentCell, { color: colors.ink, flex: 1.2 }]}>
+                        {s.thumbs_up_rate === null ? '—' : `${Math.round(s.thumbs_up_rate * 100)}%`}
+                      </Text>
+                    </View>
+                  ))}
+                  <Text style={[styles.saveChatText, { fontSize: 12, marginTop: 12, color: colors.sub }]}>
+                    Rate is out of reactions received, not total messages -- small samples here aren't a
+                    statistically significant result, just a raw signal.
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+          </View>
+        </Modal>
+
         {/* About Modal */}
         <Modal visible={showAbout} animationType="slide" onRequestClose={() => setShowAbout(false)}>
           <View style={styles.modalContainer}>
@@ -466,4 +665,32 @@ const makeStyles = (colors: any, radius: any, typography: any) =>
     modalContent: { padding: 16 },
     termsText: { fontSize: 15, lineHeight: 22, color: colors.ink },
     aboutText: { fontSize: 15, lineHeight: 22, color: colors.ink },
+    experimentPersonaRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+    experimentPersonaChip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      paddingVertical: 8,
+      paddingHorizontal: 12,
+      borderRadius: radius.pill,
+      borderWidth: 1,
+    },
+    experimentPersonaText: { fontSize: 13, fontWeight: typography.weight.medium },
+    experimentRow: {
+      flexDirection: 'row',
+      paddingVertical: 8,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.line,
+    },
+    experimentHeaderCell: { flex: 1, fontSize: 12, fontWeight: typography.weight.bold, textTransform: 'uppercase' },
+    experimentCell: { flex: 1, fontSize: 14 },
+    documentRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      paddingVertical: 10,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.line,
+    },
+    documentInfo: { flex: 1 },
   });

@@ -1,3 +1,5 @@
 api/tests/
+api/eval/
+api/finetune/
 api/.env
 api/serviceAccountKey.json

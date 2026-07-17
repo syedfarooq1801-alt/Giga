@@ -5,7 +5,6 @@ import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import ChatScreen from '../screens/ChatScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
-import { GigsScreen } from '../screens/GigsScreen';
 import AuthScreen from '../screens/AuthScreen';
 import { SharedConversationScreen } from '../screens/SharedConversationScreen';
 import { useAuth } from '../contexts/FirebaseAuthContext';
@@ -20,7 +19,6 @@ type RootStackParamList = {
 
 type MainTabParamList = {
   Chat: undefined;
-  Gigs: undefined;
   Settings: undefined;
 };
 
@@ -42,7 +40,6 @@ const linking: LinkingOptions<RootStackParamList> = {
       Main: {
         screens: {
           Chat: 'chat',
-          Gigs: 'gigs',
           Settings: 'settings',
         },
       },
@@ -71,15 +68,6 @@ const MainTabs = () => {
         options={{
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="chatbubble-outline" size={size} color={color} />
-          ),
-        }}
-      />
-      <Tab.Screen
-        name="Gigs"
-        component={GigsScreen}
-        options={{
-          tabBarIcon: ({ color, size }) => (
-            <Ionicons name="film-outline" size={size} color={color} />
           ),
         }}
       />

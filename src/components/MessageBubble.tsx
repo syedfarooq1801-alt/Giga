@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Platform } from 'react-native';
+import { View, Text, Image, StyleSheet, TouchableOpacity, ActivityIndicator, Platform } from 'react-native';
 import Markdown from 'react-native-markdown-display';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
@@ -18,6 +18,9 @@ type MessageBubbleProps = {
   isLastAssistantMessage?: boolean;
   onRegenerate?: () => void;
   isRegenerating?: boolean;
+  /** Client-side only (not persisted) preview of an image attached to a
+   *  user message -- see ChatMessage.imageUri. */
+  imageUri?: string;
 };
 
 export const MessageBubble: React.FC<MessageBubbleProps> = ({
@@ -30,26 +33,24 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   isLastAssistantMessage,
   onRegenerate,
   isRegenerating,
+  imageUri,
 }) => {
   const { colors, isDark, radius, typography } = useTheme();
   const isUser = sender === 'user';
 
-  const bubbleBg = isUser
-    ? (isDark ? (accentColor || colors.accent) : colors.userMessageBackground)
-    : colors.botMessageBackground;
-  const bubbleText = isUser ? colors.userMessageText : colors.botMessageText;
-  const bubbleRadius = isUser
-    ? { borderTopLeftRadius: radius.lg, borderTopRightRadius: radius.lg, borderBottomLeftRadius: radius.lg, borderBottomRightRadius: radius.sm / 2 }
-    : { borderTopLeftRadius: radius.lg, borderTopRightRadius: radius.lg, borderBottomRightRadius: radius.lg, borderBottomLeftRadius: radius.sm / 2 };
+  // User messages keep a bubble (right-aligned, uniform rounded corners --
+  // the one visually "contained" element in the thread). Assistant replies
+  // are flat: no background box, full-width text with a small avatar badge,
+  // matching how ChatGPT reads as continuous prose rather than chat bubbles.
+  const bubbleBg = isDark ? (accentColor || colors.accent) : colors.userMessageBackground;
+  const bubbleText = colors.userMessageText;
 
-  const bubbleContent = isUser ? (
-    <Text style={[styles.text, { color: bubbleText }]}>{text}</Text>
-  ) : (
-    <Markdown style={getMarkdownStyles(colors, bubbleText, typography)}>{text || ' '}</Markdown>
+  const assistantContent = (
+    <Markdown style={getMarkdownStyles(colors, colors.ink, typography)}>{text || ' '}</Markdown>
   );
 
   const actionsRow = !isUser && (onReact || (isLastAssistantMessage && onRegenerate)) ? (
-    <View style={[styles.actionsRow, personalityEmoji ? { marginLeft: 34 } : null]}>
+    <View style={styles.actionsRow}>
       {onReact && (
         <>
           <TouchableOpacity
@@ -96,26 +97,34 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     </View>
   ) : null;
 
-  if (!isUser && personalityEmoji) {
+  if (isUser) {
     return (
       <View style={styles.wrapper}>
-        <View style={styles.row}>
-          <Text style={styles.emoji}>{personalityEmoji}</Text>
-          <View style={[styles.container, styles.botContainer, bubbleRadius, { backgroundColor: bubbleBg, marginLeft: 4 }]}>
-            {bubbleContent}
-          </View>
+        <View
+          style={[
+            styles.container,
+            styles.userContainer,
+            { backgroundColor: bubbleBg, borderRadius: radius.lg, borderBottomRightRadius: radius.sm },
+          ]}
+        >
+          {imageUri && <Image source={{ uri: imageUri }} style={styles.attachedImage} resizeMode="cover" />}
+          {!!text && <Text style={[styles.text, { color: bubbleText }]}>{text}</Text>}
         </View>
-        {actionsRow}
       </View>
     );
   }
 
   return (
     <View style={styles.wrapper}>
-      <View style={[styles.container, isUser ? styles.userContainer : styles.botContainer, bubbleRadius, { backgroundColor: bubbleBg }]}>
-        {bubbleContent}
+      <View style={styles.assistantRow}>
+        <View style={[styles.avatar, { backgroundColor: accentColor || colors.accent }]}>
+          <Text style={styles.avatarEmoji}>{personalityEmoji || '🤖'}</Text>
+        </View>
+        <View style={styles.assistantContent}>
+          {assistantContent}
+          {actionsRow}
+        </View>
       </View>
-      {actionsRow}
     </View>
   );
 };
@@ -123,7 +132,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 // Code blocks styled off the token system (surface/line/mono stack), not
 // hardcoded colors, so they stay consistent with the rest of the app.
 const getMarkdownStyles = (colors: ReturnType<typeof useTheme>['colors'], textColor: string, typography: ReturnType<typeof useTheme>['typography']) => ({
-  body: { color: textColor, fontSize: 15, lineHeight: 21 },
+  body: { color: textColor, fontSize: 15, lineHeight: 22 },
   code_inline: {
     backgroundColor: colors.surface,
     color: textColor,
@@ -154,13 +163,6 @@ const styles = StyleSheet.create({
   wrapper: {
     marginVertical: 2,
   },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    maxWidth: '80%',
-    marginVertical: 2,
-    marginHorizontal: 8,
-  },
   container: {
     maxWidth: '80%',
     paddingVertical: 10,
@@ -171,21 +173,41 @@ const styles = StyleSheet.create({
   userContainer: {
     alignSelf: 'flex-end',
   },
-  botContainer: {
-    alignSelf: 'flex-start',
-  },
   text: {
     fontSize: 15,
-    lineHeight: 21,
+    lineHeight: 22,
   },
-  emoji: {
-    fontSize: 22,
-    marginRight: 4,
-    alignSelf: 'center',
+  attachedImage: {
+    width: 220,
+    height: 220,
+    borderRadius: 12,
+    marginBottom: 6,
+  },
+  assistantRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginHorizontal: 8,
+    marginVertical: 6,
+  },
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+    marginTop: 2,
+    flexShrink: 0,
+  },
+  avatarEmoji: {
+    fontSize: 14,
+  },
+  assistantContent: {
+    flex: 1,
+    minWidth: 0,
   },
   actionsRow: {
     flexDirection: 'row',
-    marginLeft: 12,
     marginTop: 2,
     gap: 12,
   },

@@ -102,6 +102,51 @@ async def get_groq_response(messages: list):
             delay = min(delay * 2, 5.0)  # Cap the delay at 5 seconds
 
 
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+
+async def get_groq_vision_response(system_prompt: str, text: str, image_data_url: str) -> str:
+    """Single-turn multi-modal call for image messages -- deliberately NOT
+    routed through the normal history-building path (_build_chat_messages
+    assumes plain string content everywhere); an image turn is its own
+    persona-voiced one-shot exchange, consistent with how regenerate/RAG
+    are also non-streaming, standalone code paths rather than woven into
+    the main conversation-history machinery.
+    """
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text or "What's in this image?"},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.7,
+        "max_tokens": 500,
+    }
+
+    logger = logging.getLogger("groq_handler")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(GROQ_API_URL, headers=headers, json=payload)
+        if response.status_code != 200:
+            logger.error(f"Groq vision API error {response.status_code}: {response.text}")
+            return "Hmm, couldn't look at that image properly. Try again?"
+        data = response.json()
+        return data["choices"][0]["message"].get("content", "") or ""
+    except Exception as e:
+        logger.error(f"Error in get_groq_vision_response: {str(e)}", exc_info=True)
+        return "Hmm, couldn't look at that image properly. Try again?"
+
+
 async def get_groq_response_stream(messages: list) -> AsyncGenerator[str, None]:
     """
     Sibling to get_groq_response() that yields content deltas as they arrive

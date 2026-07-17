@@ -8,6 +8,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from firebase_admin import firestore, auth
 import firebase_admin
 from firebase_admin import credentials
+from personalities import assign_variant
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -74,14 +75,18 @@ async def store_message(
         # Create a new chat if no chat_id provided
         if not chat_id:
             chat_ref = db.collection('users').document(effective_user_id).collection('chats').document()
+            # .document() generates its id client-side immediately, so it's
+            # available for the variant hash before .set() ever hits the network.
+            new_chat_id = chat_ref.id
             chat_data = {
                 'created_at': firestore.SERVER_TIMESTAMP,
                 'updated_at': firestore.SERVER_TIMESTAMP,
                 'personality': personality,
-                'title': f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                'title': f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                'prompt_variant': assign_variant(personality, new_chat_id),
             }
             chat_ref.set(chat_data)
-            chat_id = chat_ref.id
+            chat_id = new_chat_id
         else:
             chat_ref = db.collection('users').document(effective_user_id).collection('chats').document(chat_id)
             chat_doc = chat_ref.get() # Attempt to get the document
@@ -92,7 +97,8 @@ async def store_message(
                     'created_at': firestore.SERVER_TIMESTAMP,
                     'updated_at': firestore.SERVER_TIMESTAMP,
                     'personality': personality,  # Use current message's personality
-                    'title': f"Continuation of chat {datetime.now().strftime('%Y-%m-%d %H:%M')}" # Default title
+                    'title': f"Continuation of chat {datetime.now().strftime('%Y-%m-%d %H:%M')}", # Default title
+                    'prompt_variant': assign_variant(personality, chat_id),
                 }
                 chat_ref.set(chat_data) # Set will create the document if it doesn't exist
             else:
@@ -313,6 +319,139 @@ async def revoke_share(token: str, owner_uid: str) -> bool:
     except Exception as e:
         logger.error(f"Error revoking share: {str(e)}")
         return False
+
+async def get_experiment_results(persona_id: str) -> Dict[str, Any]:
+    """Aggregate message counts and thumbsUp/thumbsDown reactions per
+    prompt_variant for a persona, across all users -- powers the A/B
+    experiment results endpoint.
+
+    Each Firestore message doc is one full turn (user message + assistant
+    response + optional reactions on that response), so "messages" here is
+    a turn count and thumbs counts reflect reactions on that turn's
+    response. Requires a Firestore collection-group index on
+    messages.personality -- the console supplies the exact creation link on
+    the first FailedPrecondition error if it doesn't exist yet.
+    """
+    try:
+        variant_cache: Dict[str, str] = {}
+        stats: Dict[str, Dict[str, int]] = {}
+
+        docs = db.collection_group('messages').where('personality', '==', persona_id).stream()
+        for doc in docs:
+            data = doc.to_dict()
+            chat_ref = doc.reference.parent.parent
+            if chat_ref is None:
+                continue
+            chat_id = chat_ref.id
+            if chat_id not in variant_cache:
+                chat_doc = chat_ref.get()
+                chat_data = chat_doc.to_dict() if chat_doc.exists else {}
+                # Falls back to recomputing the hash for any chat created
+                # before prompt_variant existed on the chat doc.
+                variant_cache[chat_id] = chat_data.get('prompt_variant') or assign_variant(persona_id, chat_id)
+            variant = variant_cache[chat_id]
+
+            bucket = stats.setdefault(variant, {'messages': 0, 'thumbs_up': 0, 'thumbs_down': 0})
+            bucket['messages'] += 1
+            reactions = data.get('reactions') or {}
+            if reactions.get('thumbsUp'):
+                bucket['thumbs_up'] += 1
+            if reactions.get('thumbsDown'):
+                bucket['thumbs_down'] += 1
+
+        return stats
+    except Exception as e:
+        logger.error(f"Error aggregating experiment results: {str(e)}")
+        raise
+
+
+async def add_document_metadata(profile_id: str, user_id: str, doc_id: str, filename: str, chunk_count: int) -> None:
+    """Firestore is the system-of-record for "what did this user upload" --
+    Qdrant only holds the vectors, it's not a good place to list/manage
+    documents from."""
+    effective_user_id = profile_id or user_id
+    db.collection('users').document(effective_user_id).collection('documents').document(doc_id).set({
+        'filename': filename,
+        'chunk_count': chunk_count,
+        'uploaded_at': firestore.SERVER_TIMESTAMP,
+    })
+
+
+async def list_documents(profile_id: str, user_id: str) -> List[Dict[str, Any]]:
+    effective_user_id = profile_id or user_id
+    docs = (
+        db.collection('users').document(effective_user_id).collection('documents')
+        .order_by('uploaded_at', direction=firestore.Query.DESCENDING)
+        .stream()
+    )
+    return [{'doc_id': d.id, **d.to_dict()} for d in docs]
+
+
+async def delete_document_metadata(profile_id: str, user_id: str, doc_id: str) -> bool:
+    effective_user_id = profile_id or user_id
+    ref = db.collection('users').document(effective_user_id).collection('documents').document(doc_id)
+    if not ref.get().exists:
+        return False
+    ref.delete()
+    return True
+
+
+async def fork_conversation(
+    source_chat_id: str, source_owner_uid: str, source_profile_id: Optional[str],
+    dest_user_id: str, dest_profile_id: Optional[str]
+) -> Tuple[str, str]:
+    """Copy a conversation's full turn history into a NEW chat under a
+    different user's account -- used by the shared-chat "Continue this
+    chat" flow, so a viewer can keep chatting without writing into the
+    original owner's data. The new chat's updated_at is "now", so it's
+    naturally the destination user's most-recent conversation afterward.
+
+    Returns (new_chat_id, title).
+    """
+    try:
+        source_effective_id = source_profile_id or source_owner_uid
+        source_chat_ref = (
+            db.collection('users').document(source_effective_id)
+            .collection('chats').document(source_chat_id)
+        )
+        source_chat_doc = source_chat_ref.get()
+        source_data = source_chat_doc.to_dict() if source_chat_doc.exists else {}
+        original_title = source_data.get('title', 'Shared chat')
+        personality = source_data.get('personality', 'swag')
+
+        turns = [
+            t.to_dict() for t in
+            source_chat_ref.collection('messages').order_by('timestamp', direction=firestore.Query.ASCENDING).stream()
+        ]
+
+        dest_effective_id = dest_profile_id or dest_user_id
+        new_chat_ref = db.collection('users').document(dest_effective_id).collection('chats').document()
+        title = f"{original_title} (continued)"
+        new_chat_ref.set({
+            'created_at': firestore.SERVER_TIMESTAMP,
+            'updated_at': firestore.SERVER_TIMESTAMP,
+            'personality': personality,
+            'title': title,
+        })
+
+        batch = db.batch()
+        for turn in turns:
+            msg_ref = new_chat_ref.collection('messages').document()
+            batch.set(msg_ref, {
+                'user_id': dest_user_id,
+                'profile_id': dest_profile_id,
+                'personality': turn.get('personality', personality),
+                'message': turn.get('message'),
+                'response': turn.get('response'),
+                'timestamp': turn.get('timestamp') or firestore.SERVER_TIMESTAMP,
+            })
+        batch.commit()
+
+        return new_chat_ref.id, title
+    except Exception as e:
+        logger.error(f"Error forking conversation: {str(e)}")
+        raise
+
 
 async def delete_chat(chat_id: str, user_id: str, profile_id: str = None) -> bool:
     """Delete a chat and all its messages

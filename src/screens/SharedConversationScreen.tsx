@@ -1,21 +1,28 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, FlatList, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, Text, FlatList, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
+import { getAuth } from 'firebase/auth';
+import Toast from 'react-native-toast-message';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAuth } from '../hooks/useAuth';
 import { MessageBubble } from '../components/MessageBubble';
 import { PERSONALITIES } from '../constants/personalities';
 import { API_URL } from '../constants';
+import { setPendingConversationId } from '../utils/pendingConversation';
 import type { BackendMessage } from '../types/ChatMessage';
 
 type SharedConversationScreenProps = {
   route: { params?: { token?: string } };
+  navigation: any;
 };
 
-export const SharedConversationScreen: React.FC<SharedConversationScreenProps> = ({ route }) => {
+export const SharedConversationScreen: React.FC<SharedConversationScreenProps> = ({ route, navigation }) => {
   const { colors, typography } = useTheme();
+  const { session } = useAuth();
   const token = route?.params?.token;
   const [messages, setMessages] = useState<BackendMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [continuing, setContinuing] = useState(false);
 
   useEffect(() => {
     if (!token) {
@@ -32,6 +39,31 @@ export const SharedConversationScreen: React.FC<SharedConversationScreenProps> =
       .catch(() => setError(true))
       .finally(() => setLoading(false));
   }, [token]);
+
+  const handleContinue = async () => {
+    if (!token) return;
+    if (!session.user) {
+      Toast.show({ type: 'info', text1: 'Sign in to continue this chat', position: 'bottom' });
+      navigation.navigate('Auth');
+      return;
+    }
+    setContinuing(true);
+    try {
+      const idToken = await getAuth().currentUser?.getIdToken();
+      const res = await fetch(`${API_URL}/api/shared/${token}/continue`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data = await res.json();
+      setPendingConversationId(data.conversation_id);
+      navigation.navigate('Main', { screen: 'Chat' });
+    } catch {
+      Toast.show({ type: 'error', text1: 'Could not continue this chat', text2: 'Try again in a moment.', position: 'bottom' });
+    } finally {
+      setContinuing(false);
+    }
+  };
 
   const styles = makeStyles(colors, typography);
 
@@ -60,7 +92,7 @@ export const SharedConversationScreen: React.FC<SharedConversationScreenProps> =
       <FlatList
         data={messages}
         keyExtractor={(item) => item.id}
-        contentContainerStyle={{ padding: 10 }}
+        contentContainerStyle={{ padding: 10, paddingBottom: 90 }}
         renderItem={({ item }) => (
           <MessageBubble
             text={item.text}
@@ -71,6 +103,19 @@ export const SharedConversationScreen: React.FC<SharedConversationScreenProps> =
           />
         )}
       />
+      <View style={[styles.continueBar, { backgroundColor: colors.paper, borderTopColor: colors.line }]}>
+        <TouchableOpacity
+          style={[styles.continueButton, { backgroundColor: colors.accent }, continuing && { opacity: 0.7 }]}
+          onPress={handleContinue}
+          disabled={continuing}
+        >
+          {continuing ? (
+            <ActivityIndicator size="small" color={colors.accentContrast} />
+          ) : (
+            <Text style={[styles.continueButtonText, { color: colors.accentContrast }]}>Continue this chat</Text>
+          )}
+        </TouchableOpacity>
+      </View>
     </View>
   );
 };
@@ -88,4 +133,22 @@ const makeStyles = (colors: any, typography: any) =>
     },
     headerTitle: { color: colors.ink, fontWeight: '800', fontSize: 16, fontFamily: typography.fontFamily },
     headerSub: { color: colors.sub, fontSize: 12, marginTop: 2 },
+    continueBar: {
+      position: 'absolute',
+      left: 0,
+      right: 0,
+      bottom: 0,
+      padding: 12,
+      borderTopWidth: 1,
+    },
+    continueButton: {
+      paddingVertical: 14,
+      borderRadius: 26,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    continueButtonText: {
+      fontSize: 15,
+      fontWeight: '700',
+    },
   });

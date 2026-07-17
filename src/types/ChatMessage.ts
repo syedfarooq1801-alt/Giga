@@ -13,6 +13,10 @@ export type ChatMessage = {
   isOptimistic?: boolean; // Flag for optimistic updates
   tempId?: string; // Temporary ID for optimistic updates before server confirmation
   reactions?: MessageReactions | null;
+  // Client-side only, not persisted -- the backend stores the vision
+  // model's text response, not the image itself, so this only survives
+  // for the current session's render, not a reload.
+  imageUri?: string;
 };
 
 export type BackendMessage = {

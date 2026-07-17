@@ -14,6 +14,9 @@ type ChatHeaderProps = {
   onSelectPersonality: (personality: PersonalityType) => void;
   isDefaultPersonality: boolean;
   onShare?: () => void;
+  /** Persistent sidebar (wide web) already exposes conversation history --
+   *  the hamburger/modal path is redundant there. */
+  hideMenuButton?: boolean;
 };
 
 export const ChatHeader: React.FC<ChatHeaderProps> = ({
@@ -23,18 +26,21 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
   onSelectPersonality,
   isDefaultPersonality,
   onShare,
+  hideMenuButton,
 }) => {
   const { colors, typography } = useTheme();
 
   return (
     <View style={[styles.container, { backgroundColor: colors.paper, borderBottomColor: colors.line }]}>
-      <TouchableOpacity onPress={onPressConversations} style={styles.menuButton}>
-        <View style={styles.hamburger}>
-          <View style={[styles.hamburgerLine, { backgroundColor: colors.ink }]} />
-          <View style={[styles.hamburgerLine, { backgroundColor: colors.ink }]} />
-          <View style={[styles.hamburgerLine, { backgroundColor: colors.ink }]} />
-        </View>
-      </TouchableOpacity>
+      {!hideMenuButton && (
+        <TouchableOpacity onPress={onPressConversations} style={styles.menuButton}>
+          <View style={styles.hamburger}>
+            <View style={[styles.hamburgerLine, { backgroundColor: colors.ink }]} />
+            <View style={[styles.hamburgerLine, { backgroundColor: colors.ink }]} />
+            <View style={[styles.hamburgerLine, { backgroundColor: colors.ink }]} />
+          </View>
+        </TouchableOpacity>
+      )}
 
       <Image source={GigaLogo} style={[styles.logo, { backgroundColor: colors.surface }]} resizeMode="contain" />
 

@@ -30,16 +30,11 @@ export const TypingBubble: React.FC = () => {
 
   return (
     <View style={styles.row}>
+      <View style={[styles.avatar, { backgroundColor: colors.accent }]} />
       <View
         style={[
           styles.container,
-          {
-            backgroundColor: colors.botMessageBackground,
-            borderTopLeftRadius: radius.lg,
-            borderTopRightRadius: radius.lg,
-            borderBottomRightRadius: radius.lg,
-            borderBottomLeftRadius: radius.sm / 2,
-          },
+          { backgroundColor: colors.botMessageBackground, borderRadius: radius.lg },
         ]}
       >
         {[0, 1, 2].map((i) => (
@@ -60,10 +55,16 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    maxWidth: '80%',
-    marginVertical: 4,
+    marginVertical: 6,
     marginHorizontal: 8,
     justifyContent: 'flex-start',
+  },
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    marginRight: 12,
+    flexShrink: 0,
   },
   container: {
     minWidth: 52,

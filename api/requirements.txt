@@ -4,3 +4,16 @@ python-dotenv==1.0.0
 firebase-admin==6.1.0
 httpx==0.24.0
 slowapi==0.1.10
+qdrant-client==1.18.0
+pypdf==6.11.0
+
+# NOT listed here: sentence-transformers / torch / peft / transformers.
+# They power RAG's local embeddings (api/rag.py) and fine-tuned model
+# serving (api/local_llm.py) but are far too large for a serverless
+# function bundle -- install them separately for local dev
+# (pip install sentence-transformers peft; transformers comes in as a
+# dependency of sentence-transformers). Both modules import these lazily
+# and degrade gracefully (empty RAG results / Groq fallback, not a crash)
+# if they're missing, so a deploy without them still serves normal chat
+# correctly -- and LOCAL_MODEL_PATH being unset means local_llm.py is
+# fully inert regardless.

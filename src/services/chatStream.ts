@@ -16,7 +16,8 @@ export async function sendMessageToBackendStream(
   profileId: string,
   conversationId: string,
   userId: string,
-  onChunk: (chunk: string) => void
+  onChunk: (chunk: string) => void,
+  useDocuments = false
 ): Promise<StreamResult> {
   const auth = getAuth();
   const currentUser = auth.currentUser;
@@ -35,6 +36,7 @@ export async function sendMessageToBackendStream(
       conversation_id: conversationId || undefined,
       user_id: userId,
       profile_id: profileId,
+      use_documents: useDocuments,
     }),
   });
 

@@ -8,7 +8,13 @@
       "Bash(curl -s http://localhost:8000/personalities)",
       "Bash(curl -s -X POST http://localhost:8000/get-test-token)",
       "Bash(npm install *)",
-      "Bash(rm -f package-lock.json)"
+      "Bash(rm -f package-lock.json)",
+      "Bash(rm -rf .expo dist)",
+      "Bash(npm run *)",
+      "Bash(npx patch-package *)",
+      "Bash(rm -rf node_modules .expo dist)",
+      "Bash(ls -la \"/c/Users/SYEDFA~1/AppData/Local/Temp/claude/C--Users-Syed-Farooq-Desktop-Giga/1c11a426-a13d-4d1f-b443-370d6d3a7848/tasks/\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:4173)"
     ]
   }
 }

@@ -16,13 +16,14 @@ import {
   KeyboardAvoidingView,
   Modal,
   Pressable,
-  Image
+  Image,
+  useWindowDimensions
 } from 'react-native';
 
 
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import { StackNavigationProp } from '@react-navigation/stack';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { useAuth } from '../hooks/useAuth';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MaterialCommunityIcons, MaterialIcons as Icon } from '@expo/vector-icons';
@@ -33,11 +34,17 @@ import { getPersonaAccent } from '../theme/tokens';
 import { sendMessageToBackendStream } from '../services/chatStream';
 import Toast from 'react-native-toast-message';
 import { getAuth } from 'firebase/auth';
-import { getConversationTitleFromMistral } from '../utils/mistralTitle';
+import { getConversationTitleFromGroq } from '../utils/groqTitle';
+import { pickAndUploadDocument } from '../services/documents';
+import * as ImagePicker from 'expo-image-picker';
 import { PersonalityType } from '../types/chat';
 import { Conversation } from '../types/Conversation';
 import { ChatMessage, BackendMessage, mapBackendMessageToChatMessage } from '../types/ChatMessage';
 import { RootStackParamList } from '../types/navigation';
+
+import { consumePendingConversationId } from '../utils/pendingConversation';
+
+const GigaLogo = require('../Giga-logo1.png');
 
 type ChatScreenNavigationProp = StackNavigationProp<RootStackParamList, 'Chat'>;
 
@@ -97,9 +104,11 @@ const sendMessageToBackendAndGetResponse = async (
   personalityId: string,
   profileId: string,
   conversationId: string | null,
-  userId: string
+  userId: string,
+  useDocuments = false,
+  imageDataUrl?: string
 ): Promise<{ message: ChatMessage; conversationId: string } | null> => {
-  if (!text || !personalityId || !profileId || !userId) { // conversationId can be null for new chats
+  if ((!text && !imageDataUrl) || !personalityId || !profileId || !userId) { // conversationId can be null for new chats
     throw new Error('Missing required parameters');
   }
   try {
@@ -124,6 +133,8 @@ const sendMessageToBackendAndGetResponse = async (
       conversation_id: conversationId || undefined,
       user_id: userId,
       profile_id: profileId,
+      use_documents: useDocuments,
+      image: imageDataUrl,
     };
     
     console.log('Sending chat request:', requestBody);
@@ -194,17 +205,48 @@ const ChatScreen = () => {
   const [isTtsPlaying, setIsTtsPlaying] = useState(false);
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
   const [inputText, setInputText] = useState('');
+  // "Use my docs" toggle -- per-session UI state, not persisted server-side
+  // (see api/rag.py's rag_override: the request itself is the single
+  // source of truth for whether RAG runs on a given turn, no extra
+  // Firestore read needed).
+  const [useDocuments, setUseDocuments] = useState(false);
+  const [isUploadingDoc, setIsUploadingDoc] = useState(false);
+  const [pendingImage, setPendingImage] = useState<{ dataUrl: string } | null>(null);
   const [selectedPersonality, setSelectedPersonality] = useState<PersonalityType>(PERSONALITIES[DEFAULT_PERSONALITY_ID]);
   const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
   const [isOnline, setIsOnline] = useState(true);
   const [profileId, setProfileId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
+  // Wide web viewports get a persistent left sidebar (ChatGPT's structure);
+  // narrower/native falls back to the hamburger + modal history pattern.
+  const { width: windowWidth } = useWindowDimensions();
+  const isWideScreen = Platform.OS === 'web' && windowWidth >= 900;
   const { session, loading: authLoading } = useAuth();
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const navigation = useNavigation<StackNavigationProp<RootStackParamList, 'Chat'>>();
   const flatListRef = useRef<any>(null);
   const inputRef = useRef<any>(null);
+  // Tracks whether the user is scrolled near the bottom -- auto-scroll only
+  // sticks when true, so streaming replies don't yank the view down if
+  // they've scrolled up to read earlier history (matches ChatGPT behavior).
+  const isNearBottomRef = useRef(true);
+
+  // VirtualizedList's scrollToEnd() targets its own internally-tracked
+  // content length (fed by onContentSizeChange), which doesn't update
+  // reliably through react-native-web's FlatList -- it ends up scrolling to
+  // a stale, too-short target. On web we bypass that entirely and drive the
+  // real DOM scroll node directly; on native, RN's scrollToEnd is correct.
+  const scrollToBottom = useCallback((animated: boolean) => {
+    if (Platform.OS === 'web') {
+      const node = flatListRef.current?.getScrollableNode?.();
+      if (node) {
+        node.scrollTop = node.scrollHeight;
+        return;
+      }
+    }
+    flatListRef.current?.scrollToEnd?.({ animated });
+  }, []);
 
   // Set up network listener
   useEffect(() => {
@@ -217,40 +259,48 @@ const ChatScreen = () => {
   // State to hold all conversations
   const [conversations, setConversations] = useState<Conversation[]>([]);
 
+  // Loads the user's conversations from the backend (single source of
+  // truth -- the old direct-Firestore-write path here was disconnected
+  // from what the backend actually persists) and sets the most recent as
+  // current. Hoisted to a stable callback (not just inline in the session
+  // effect below) so it can also be re-run on focus -- that's what picks up
+  // a conversation just forked from a shared-chat link, since forking
+  // happens on a different screen and only updates the backend's most-
+  // recent-conversation ordering, not this screen's already-mounted state.
+  const restoreLastConversation = useCallback(async (pid: string, selectId?: string) => {
+    try {
+      const authInstance = getAuth();
+      const idToken = await authInstance.currentUser?.getIdToken();
+      const res = await fetch(`${API_URL}/api/conversations`, {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.ok) throw new Error(`Backend error: ${res.status}`);
+      const data = await res.json();
+      const fetched: Conversation[] = (data.conversations || []).map((c: any) => ({
+        id: c.id,
+        title: c.title || 'Untitled',
+        lastMessage: c.last_message || '',
+        timestamp: c.last_message_time ? new Date(c.last_message_time) : new Date(),
+        personalityId: c.personality || DEFAULT_PERSONALITY_ID,
+      }));
+      setConversations(fetched);
+      if (fetched.length === 0) {
+        console.log('[ChatScreen] No conversations found for profile. Will create new conversation on first message.');
+        setCurrentConversation(null);
+      } else if (selectId) {
+        setCurrentConversation(fetched.find(c => c.id === selectId) || fetched[0]);
+      } else {
+        setCurrentConversation(fetched[0]); // Set most recent as current
+      }
+    } catch (error) {
+      console.error('[ChatScreen] Error loading conversations:', error);
+      setConversations([]);
+      setCurrentConversation(null);
+    }
+  }, []);
+
   // Derive profileId and userId from session
   useEffect(() => {
-    // Loads the user's conversations from the backend (single source of
-    // truth -- the old direct-Firestore-write path here was disconnected
-    // from what the backend actually persists) and sets the most recent as current.
-    const restoreLastConversation = async (profileId: string) => {
-      try {
-        const authInstance = getAuth();
-        const idToken = await authInstance.currentUser?.getIdToken();
-        const res = await fetch(`${API_URL}/api/conversations`, {
-          headers: { Authorization: `Bearer ${idToken}` },
-        });
-        if (!res.ok) throw new Error(`Backend error: ${res.status}`);
-        const data = await res.json();
-        const fetched: Conversation[] = (data.conversations || []).map((c: any) => ({
-          id: c.id,
-          title: c.title || 'Untitled',
-          lastMessage: c.last_message || '',
-          timestamp: c.last_message_time ? new Date(c.last_message_time) : new Date(),
-          personalityId: c.personality || DEFAULT_PERSONALITY_ID,
-        }));
-        setConversations(fetched);
-        if (fetched.length === 0) {
-          console.log('[ChatScreen] No conversations found for profile. Will create new conversation on first message.');
-          setCurrentConversation(null);
-        } else {
-          setCurrentConversation(fetched[0]); // Set most recent as current
-        }
-      } catch (error) {
-        console.error('[ChatScreen] Error loading conversations:', error);
-        setConversations([]);
-        setCurrentConversation(null);
-      }
-    };
     if (session?.user && session.profileId) {
       setProfileId(session.profileId);
       setUserId(session.user.uid);
@@ -261,7 +311,19 @@ const ChatScreen = () => {
       setUserId(null);
       setCurrentConversation(null);
     }
-  }, [session, authLoading]);
+  }, [session, authLoading, restoreLastConversation]);
+
+  // Only acts when a conversation was just forked elsewhere (shared-chat
+  // "Continue this chat") -- an ordinary tab switch back to Chat is a no-op,
+  // so the user's manually-selected conversation is never silently reset.
+  useFocusEffect(
+    useCallback(() => {
+      const pendingId = consumePendingConversationId();
+      if (pendingId && profileId) {
+        restoreLastConversation(profileId, pendingId);
+      }
+    }, [profileId, restoreLastConversation])
+  );
 
   const handleNetworkChange = (state: NetInfoState) => {
     setIsOnline(state.isConnected ?? false);
@@ -286,10 +348,99 @@ const ChatScreen = () => {
     return conversation;
   };
 
+  // Auto-titles a conversation from its first exchange (ChatGPT-style),
+  // replacing the generic "Continuation of chat <timestamp>" default that
+  // store_message() stamps on chat-doc creation. Fire-and-forget from the
+  // caller -- this shouldn't block or fail the actual send.
+  const generateAndSetConversationTitle = async (conversationId: string, userText: string, assistantText: string) => {
+    try {
+      const authInstance = getAuth();
+      const idToken = await authInstance.currentUser?.getIdToken();
+      const title = await getConversationTitleFromGroq([{ text: userText }, { text: assistantText }]);
+      if (!title.trim()) return;
+
+      const res = await fetch(`${API_URL}/api/conversations/${conversationId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ title }),
+      });
+      if (!res.ok) return;
+
+      // This is the conversation's FIRST message -- it was only just
+      // created server-side by this same send, so it's very likely not in
+      // local `conversations` state yet (that list is only populated by a
+      // fetch, and nothing re-fetches mid-send). A plain .map() would
+      // silently no-op in that case, leaving the sidebar showing the stale
+      // default title until the next reload/switch -- prepend a fresh
+      // entry instead when there's nothing to update in place.
+      setConversations(prev => {
+        const exists = prev.some(c => c.id === conversationId);
+        if (exists) return prev.map(c => (c.id === conversationId ? { ...c, title } : c));
+        return [
+          {
+            id: conversationId,
+            title,
+            lastMessage: assistantText,
+            timestamp: new Date(),
+            personalityId: selectedPersonality.id,
+          },
+          ...prev,
+        ];
+      });
+      setCurrentConversation(prev => (prev && prev.id === conversationId ? { ...prev, title } : prev));
+    } catch (error) {
+      console.error('[ChatScreen] Failed to auto-title conversation:', error);
+    }
+  };
+
+  // Upload straight from the chat input (paperclip icon) instead of
+  // requiring a detour through Settings -- auto-enables "use my docs" on a
+  // successful upload, since uploading something is a clear signal the
+  // user wants the next reply to use it.
+  const handleAttachDocument = async () => {
+    setIsUploadingDoc(true);
+    const result = await pickAndUploadDocument();
+    setIsUploadingDoc(false);
+    if (result) setUseDocuments(true);
+  };
+
+  // Picks an image and stores it as a data URL for the NEXT send -- vision
+  // is a one-shot per-message thing (see api/groq_handler.py's
+  // get_groq_vision_response), not a persistent per-conversation toggle
+  // like RAG, so there's no equivalent "enable" flag to flip here.
+  const handleAttachImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      base64: true,
+      quality: 0.6,
+    });
+    if (result.canceled || !result.assets || result.assets.length === 0) return;
+    const asset = result.assets[0];
+    if (!asset.base64) {
+      Toast.show({ type: 'error', text1: 'Could not read that image', position: 'bottom' });
+      return;
+    }
+    const mimeType = asset.mimeType || 'image/jpeg';
+    setPendingImage({ dataUrl: `data:${mimeType};base64,${asset.base64}` });
+  };
+
   const handleSendMessage = async (text: string) => {
-    if (!profileId || !userId || !text.trim()) return;
+    if (!profileId || !userId || (!text.trim() && !pendingImage)) return;
 
     console.log('Sending message:', { text, profileId, userId });
+
+    // Captured immediately: clearing pendingImage right away (rather than
+    // after the request resolves) makes the input bar's preview disappear
+    // the instant you hit send, matching how inputText itself is cleared
+    // below -- not left hanging until the network round-trip finishes.
+    const imageToSend = pendingImage;
+    setPendingImage(null);
+
+    // Captured before any optimistic state mutation below -- this is the
+    // one reliable way to know "was this conversation empty before this
+    // turn", which is what should trigger auto-titling (once, on the first
+    // exchange, not on every message after).
+    const isFirstMessageInConversation = messages.length === 0;
 
     // Generate a temporary ID for optimistic update
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -311,7 +462,8 @@ const ChatScreen = () => {
       personalityId: selectedPersonality.id,
       profileId,
       conversationId: convId,
-      isOptimistic: true
+      isOptimistic: true,
+      imageUri: imageToSend?.dataUrl,
     };
 
     // Add temporary message to state immediately for optimistic update
@@ -337,13 +489,11 @@ const ChatScreen = () => {
 
     setInputText('');
     setIsTyping(true);
-    
-    // Scroll to bottom after adding the message
-    setTimeout(() => {
-      if (flatListRef.current) {
-        flatListRef.current.scrollToEnd({ animated: true });
-      }
-    }, 100);
+
+    // Sending a message always jumps to the bottom, regardless of where the
+    // user was scrolled -- onContentSizeChange picks this up on the next
+    // content-size change (the new message / streaming reply arriving).
+    isNearBottomRef.current = true;
 
     try {
       // The user's message is no longer written to Firestore directly from
@@ -356,7 +506,10 @@ const ChatScreen = () => {
       // Send to backend and get AI response.
       // Web: stream the reply in sentence chunks. Native: wait for the full
       // response (RN's fetch doesn't reliably support ReadableStream yet).
-      if (Platform.OS === 'web') {
+      // Image turns always use the non-streaming path regardless of
+      // platform -- vision is a one-shot Groq call (get_groq_vision_response
+      // in api/groq_handler.py), there's no streaming vision endpoint.
+      if (Platform.OS === 'web' && !imageToSend) {
         const streamId = `stream-${Date.now()}`;
         const userTs = userMessage.timestamp.getTime();
         const streamPlaceholder: ChatMessage = {
@@ -387,7 +540,8 @@ const ChatScreen = () => {
               setMessages(prev =>
                 prev.map(msg => (msg.id === streamId ? { ...msg, text: msg.text + chunk } : msg))
               );
-            }
+            },
+            useDocuments
           );
 
           setIsTyping(false);
@@ -419,6 +573,10 @@ const ChatScreen = () => {
               timestamp: streamPlaceholder.timestamp,
               personalityId: selectedPersonality.id,
             });
+
+            if (isFirstMessageInConversation) {
+              void generateAndSetConversationTitle(finalConvId, userMessage.text, finalText);
+            }
           }
         } catch (streamError) {
           console.error('Error streaming message:', streamError);
@@ -435,7 +593,9 @@ const ChatScreen = () => {
         selectedPersonality.id,
         profileId,
         convId,
-        userId
+        userId,
+        useDocuments,
+        imageToSend?.dataUrl
       );
 
       if (backendResult?.message && backendResult.conversationId) {
@@ -486,6 +646,10 @@ const ChatScreen = () => {
           timestamp: aiMessage.timestamp,
           personalityId: aiMessage.personalityId,
         });
+
+        if (isFirstMessageInConversation) {
+          void generateAndSetConversationTitle(returnedConversationId, userMessage.text, aiMessage.text);
+        }
 
         // Stop the typing indicator as soon as we've processed the AI message
         setIsTyping(false);
@@ -628,9 +792,16 @@ const ChatScreen = () => {
     } finally {
       setIsLoadingMessages(false);
     }
-  }, [profileId, userId, currentConversation]);
+  }, [profileId, userId, currentConversation?.id]);
 
-  // Effect to load messages when profileId or currentConversation changes
+  // Effect to load messages when profileId or the ACTIVE conversation
+  // changes. Deliberately depends on currentConversation?.id, not the
+  // whole currentConversation object -- handleSendMessage calls
+  // setCurrentConversation({...}) with a fresh object after every single
+  // send (to bump lastMessage/timestamp), which doesn't change which
+  // conversation is open. Depending on the object itself made this effect
+  // (and the full-screen loading overlay it triggers via loadMessages)
+  // refire on every message sent, not just on an actual conversation switch.
   useEffect(() => {
     if (profileId && currentConversation && currentConversation.id) {
       console.log(`[ChatScreen] useEffect: Valid profileId (${profileId}) and currentConversation.id (${currentConversation.id}). Calling loadMessages.`);
@@ -645,14 +816,20 @@ const ChatScreen = () => {
       // Messages will update once currentConversation is properly set and loadMessages runs.
       console.log(`[ChatScreen] useEffect: Valid profileId (${profileId}) but currentConversation is not ready. Waiting for currentConversation to settle.`);
     }
-  }, [profileId, currentConversation, loadMessages]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileId, currentConversation?.id, loadMessages]);
 
-  // Auto-scroll to bottom when messages change
+  // Primary auto-scroll trigger. onContentSizeChange doesn't fire reliably
+  // through react-native-web's FlatList, so this plain effect (which fires
+  // on every messages-array identity change, including per-chunk updates
+  // during streaming) is the real source of truth -- non-animated so rapid
+  // streaming updates don't stack animated scrolls, and gated on
+  // isNearBottomRef so it doesn't yank the view if the user scrolled up.
   useEffect(() => {
-    if (flatListRef.current && messages.length > 0) {
-      flatListRef.current.scrollToEnd({ animated: true });
+    if (messages.length > 0 && isNearBottomRef.current) {
+      scrollToBottom(false);
     }
-  }, [messages]);
+  }, [messages, scrollToBottom]);
 
   // Web: Enter sends, Shift+Enter inserts a newline. RN's multiline
   // TextInput maps to a plain <textarea> under react-native-web, and
@@ -1063,7 +1240,8 @@ const ChatScreen = () => {
           selectedPersonality.id, // Use the ID of the selected personality
           profileId,
           currentConversation.id,
-          userId
+          userId,
+          useDocuments
         );
 
         if (!response) {
@@ -1167,27 +1345,64 @@ const ChatScreen = () => {
     },
     messageList: {
       flex: 1,
-      paddingHorizontal: 10,
+      paddingHorizontal: 24,
+    },
+    inputOuter: {
+      paddingHorizontal: 24,
+      paddingTop: 8,
+      paddingBottom: 14,
     },
     inputContainer: {
       flexDirection: 'row',
       alignItems: 'center',
-      padding: 10,
-      borderTopWidth: 1,
-      borderTopColor: colors.line,
-      backgroundColor: colors.paper,
+      padding: 6,
+      borderRadius: 26,
+      borderWidth: 1,
+      borderColor: colors.line,
+      backgroundColor: colors.surface,
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.06,
+      shadowRadius: 10,
+      elevation: 2,
     },
     input: {
       flex: 1,
       minHeight: 40,
-      maxHeight: 120,
-      paddingHorizontal: 16,
+      maxHeight: 160,
+      paddingHorizontal: 14,
       paddingVertical: 10,
-      backgroundColor: colors.surface,
-      borderRadius: 999,
-      marginHorizontal: 8,
+      backgroundColor: 'transparent',
+      marginHorizontal: 2,
       color: colors.ink,
       fontSize: 15,
+    },
+    docsToggle: {
+      width: 34,
+      height: 34,
+      borderRadius: 17,
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginLeft: 4,
+    },
+    pendingImageRow: {
+      paddingHorizontal: 12,
+      paddingBottom: 8,
+    },
+    pendingImageThumb: {
+      width: 56,
+      height: 56,
+      borderRadius: 10,
+    },
+    pendingImageRemove: {
+      position: 'absolute',
+      top: -6,
+      left: 46,
+      width: 20,
+      height: 20,
+      borderRadius: 10,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
     sendButton: {
       width: 40,
@@ -1291,6 +1506,55 @@ const ChatScreen = () => {
       alignItems: 'center',
       backgroundColor: 'rgba(0,0,0,0.1)',
     },
+    sidebar: {
+      width: 260,
+      borderRightWidth: 1,
+      paddingTop: 14,
+      paddingHorizontal: 10,
+    },
+    sidebarHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 6,
+      marginBottom: 14,
+    },
+    sidebarLogo: {
+      width: 26,
+      height: 26,
+      borderRadius: 8,
+      marginRight: 8,
+    },
+    sidebarAppName: {
+      fontSize: 15,
+      fontWeight: '800',
+      letterSpacing: -0.3,
+    },
+    newChatButton: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      paddingVertical: 10,
+      paddingHorizontal: 12,
+      borderRadius: 12,
+      borderWidth: 1,
+      marginBottom: 10,
+    },
+    newChatText: {
+      fontSize: 14,
+      fontWeight: '600',
+    },
+    sidebarList: {
+      flex: 1,
+    },
+    sidebarItem: {
+      paddingVertical: 10,
+      paddingHorizontal: 12,
+      borderRadius: 10,
+      marginBottom: 2,
+    },
+    sidebarItemText: {
+      fontSize: 13.5,
+    },
   });
 
   if (authLoading) {
@@ -1319,6 +1583,42 @@ const ChatScreen = () => {
   const keyboardVerticalOffset = Platform.OS === 'ios' ? 64 : Platform.OS === 'android' ? 0 : 0;
 
   return (
+    <View style={{ flex: 1, flexDirection: 'row', backgroundColor: colors.paper }}>
+      {isWideScreen && (
+        <View style={[styles.sidebar, { backgroundColor: colors.surface, borderRightColor: colors.line }]}>
+          <View style={styles.sidebarHeader}>
+            <Image source={GigaLogo} style={styles.sidebarLogo} resizeMode="contain" />
+            <Text style={[styles.sidebarAppName, { color: colors.ink }]}>Giga BhAI</Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.newChatButton, { borderColor: colors.line, opacity: messages.length === 0 ? 0.5 : 1 }]}
+            disabled={messages.length === 0}
+            onPress={() => createNewConversation()}
+          >
+            <MaterialCommunityIcons name="plus" size={18} color={accentColor} />
+            <Text style={[styles.newChatText, { color: colors.ink }]}>New chat</Text>
+          </TouchableOpacity>
+          <FlatList
+            data={conversations}
+            keyExtractor={(item: Conversation) => item.id}
+            style={styles.sidebarList}
+            renderItem={({ item }: { item: Conversation }) => (
+              <TouchableOpacity
+                style={[
+                  styles.sidebarItem,
+                  currentConversation?.id === item.id && { backgroundColor: colors.line },
+                ]}
+                onPress={() => setCurrentConversation(item)}
+              >
+                <Text style={[styles.sidebarItemText, { color: colors.ink }]} numberOfLines={1}>
+                  {item.title}
+                </Text>
+              </TouchableOpacity>
+            )}
+            ListEmptyComponent={<Text style={[styles.emptyText, { fontSize: 13 }]}>No conversations yet.</Text>}
+          />
+        </View>
+      )}
     <Container
       style={[styles.container, { flex: 1 }]}
       {...(!isWeb ? {
@@ -1334,6 +1634,7 @@ const ChatScreen = () => {
         onSelectPersonality={handlePersonalitySelect}
         isDefaultPersonality={selectedPersonality.id === DEFAULT_PERSONALITY_ID}
         onShare={currentConversation?.id ? handleShare : undefined}
+        hideMenuButton={isWideScreen}
       />
       {!isOnline && (
         <View style={styles.networkStatusBar}>
@@ -1369,6 +1670,7 @@ const ChatScreen = () => {
               isLastAssistantMessage={item.sender === 'assistant' && item.id === lastAssistantId}
               onRegenerate={item.messageDocId ? () => handleRegenerate(item) : undefined}
               isRegenerating={regeneratingId === item.id}
+              imageUri={item.imageUri}
             />
           );
         }}
@@ -1380,15 +1682,20 @@ const ChatScreen = () => {
           paddingTop: 0 
         }}
         onContentSizeChange={() => {
-          if (flatListRef.current) {
-            flatListRef.current.scrollToEnd({ animated: true });
+          // Single source of truth for auto-scroll. Non-animated: during
+          // streaming this fires on every chunk, and stacking animated
+          // scrolls is exactly what caused the jank. Only sticks if the
+          // user hasn't scrolled up to read history.
+          if (isNearBottomRef.current) {
+            scrollToBottom(false);
           }
         }}
-        onLayout={() => {
-          if (flatListRef.current) {
-            flatListRef.current.scrollToEnd({ animated: false });
-          }
+        onScroll={({ nativeEvent }: any) => {
+          const { layoutMeasurement, contentOffset, contentSize } = nativeEvent;
+          const distanceFromBottom = contentSize.height - layoutMeasurement.height - contentOffset.y;
+          isNearBottomRef.current = distanceFromBottom < 120;
         }}
+        scrollEventThrottle={16}
         ListEmptyComponent={() => (
           !isLoadingMessages && (
             <Text style={styles.emptyText}>
@@ -1401,10 +1708,53 @@ const ChatScreen = () => {
         maxToRenderPerBatch={10}
         windowSize={21}
       />
-      <View style={[styles.inputContainer, { marginBottom: Platform.OS === 'ios' ? 8 : Platform.OS === 'android' ? 4 : 0 }]}>
+      <View style={[styles.inputOuter, { paddingBottom: Platform.OS === 'ios' ? 20 : Platform.OS === 'android' ? 16 : 14 }]}>
+      {pendingImage && (
+        <View style={styles.pendingImageRow}>
+          <Image source={{ uri: pendingImage.dataUrl }} style={styles.pendingImageThumb} />
+          <TouchableOpacity
+            onPress={() => setPendingImage(null)}
+            style={[styles.pendingImageRemove, { backgroundColor: colors.surface }]}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            <MaterialCommunityIcons name="close" size={14} color={colors.ink} />
+          </TouchableOpacity>
+        </View>
+      )}
+      <View style={styles.inputContainer}>
+        <TouchableOpacity
+          onPress={handleAttachImage}
+          style={styles.docsToggle}
+          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+        >
+          <MaterialCommunityIcons name="image-outline" size={18} color={colors.sub} />
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={handleAttachDocument}
+          disabled={isUploadingDoc}
+          style={styles.docsToggle}
+          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+        >
+          {isUploadingDoc ? (
+            <ActivityIndicator size="small" color={colors.sub} />
+          ) : (
+            <MaterialCommunityIcons name="paperclip" size={18} color={colors.sub} />
+          )}
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => setUseDocuments(prev => !prev)}
+          style={[styles.docsToggle, useDocuments && { backgroundColor: accentColor }]}
+          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+        >
+          <MaterialCommunityIcons
+            name="file-document-outline"
+            size={18}
+            color={useDocuments ? colors.accentContrast : colors.sub}
+          />
+        </TouchableOpacity>
         <TextInput
           ref={inputRef}
-          style={[styles.input, { minHeight: 40, maxHeight: 120 }]}
+          style={styles.input}
           value={inputText}
           onChangeText={setInputText}
           placeholder={`Message ${selectedPersonality.name}...`}
@@ -1454,9 +1804,10 @@ const ChatScreen = () => {
           <MaterialCommunityIcons name="send" size={20} color={colors.accentContrast} />
         </TouchableOpacity>
       </View>
+      </View>
 
       <Modal
-        visible={showHistoryModal}
+        visible={showHistoryModal && !isWideScreen}
         transparent
         animationType="slide"
         onRequestClose={() => setShowHistoryModal(false)}
@@ -1513,6 +1864,7 @@ const ChatScreen = () => {
         </View>
       }
     </Container>
+    </View>
   );
 };
 

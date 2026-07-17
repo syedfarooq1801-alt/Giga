@@ -8,8 +8,9 @@ from pydantic import BaseModel
 from firebase_admin import auth, firestore
 from firebase_admin.exceptions import FirebaseError
 from firebase_auth import verify_firebase_token
-from groq_handler import get_groq_response, get_groq_response_stream
-from personalities import get_personality_context
+from groq_handler import get_groq_response, get_groq_response_stream, get_groq_vision_response
+from personalities import get_personality_context, assign_variant
+from google.api_core.exceptions import FailedPrecondition as GoogleFailedPrecondition
 from firebase_memory_manager import (
     store_message,
     get_chat_history,
@@ -20,7 +21,14 @@ from firebase_memory_manager import (
     set_message_reaction,
     create_share_token,
     get_share,
+    fork_conversation,
+    get_experiment_results,
+    add_document_metadata,
+    list_documents,
+    delete_document_metadata,
 )
+from rag import upload_document, delete_document_vectors, search_context
+from local_llm import generate_finetuned_response
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -733,18 +741,40 @@ def remove_meta_references(resp):
     return cleaned.strip()
 
 
-async def _build_chat_messages(message: str, personality: str, conversation_id: str, current_user: dict):
+async def _build_chat_messages(
+    message: str,
+    personality: str,
+    conversation_id: str,
+    current_user: dict,
+    variant_override: Optional[str] = None,
+    rag_override: Optional[bool] = None,
+):
     """
     Shared preamble for /chat and /chat/stream: resolves user/profile ids,
     fetches personality context + this conversation's history/compressed
     memory, and assembles the final messages list to send to the LLM.
     Pure/side-effect-free — runs identically and unconditionally before the
     LLM call in both endpoints.
+
+    variant_override/rag_override let callers (the eval harness, in
+    particular) pin a clean baseline -- e.g. force the control prompt
+    variant and force RAG off -- instead of picking up whatever a chat's
+    hash-assigned variant or per-conversation rag_enabled flag happens to
+    be. Both are None in normal request flow, which is a no-op today; Phase
+    2 (A/B variants) and Phase 3 (RAG) wire real behavior behind them.
     """
     user_id = current_user.get('uid')
     profile_id = current_user.get('profile_id')
 
-    personality_context = get_personality_context(personality)
+    # Deterministic, zero-I/O variant assignment -- conversation_id is
+    # always a stable, already-generated UUID by the time this runs (see
+    # /chat's pre-generation of a fresh id when the client sends none), so
+    # re-hashing it here always agrees with what store_message() persists
+    # on chat-doc creation, with no Firestore read needed on the hot path.
+    variant = variant_override if variant_override else (
+        assign_variant(personality, conversation_id) if conversation_id else "control"
+    )
+    personality_context = get_personality_context(personality, variant=variant)
 
     # Get compressed memory or chat history for THIS conversation only
     chat_history = []
@@ -779,6 +809,27 @@ async def _build_chat_messages(message: str, personality: str, conversation_id: 
 
     # Build the full context for the LLM (guaranteed to be scoped to this conversation only)
     messages = []
+
+    # RAG: rag_override is the per-request "use my docs" toggle from the
+    # client (see /chat, /chat/stream) -- there's no persisted per-chat
+    # flag, so this is the single source of truth for whether augmentation
+    # runs. search_context() NEVER raises; an empty list (Qdrant down, no
+    # matching docs, embeddings unavailable) just means no context message
+    # gets added -- chat continues normally either way.
+    if rag_override and profile_id:
+        try:
+            context_chunks = await search_context(profile_id, message)
+        except Exception as e:
+            logger.warning(f"RAG context lookup failed, continuing without it: {e}")
+            context_chunks = []
+        if context_chunks:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Relevant context from the user's uploaded documents (use it if helpful, "
+                    "ignore it if not relevant to their message):\n\n" + "\n---\n".join(context_chunks)
+                ),
+            })
 
     # 1. Add personality context (system prompt and intro)
     if personality_context and isinstance(personality_context, list):
@@ -841,9 +892,12 @@ async def chat(
         message = data.get("message")
         personality = data.get("personality", "swag")
         conversation_id = data.get("conversation_id")
+        use_documents = bool(data.get("use_documents", False))
+        use_finetuned = bool(data.get("use_finetuned", False))
+        image_data_url = data.get("image")  # data:image/...;base64,... or None
         if not conversation_id:
             conversation_id = str(uuid.uuid4())
-            
+
         # Log the incoming request for debugging
         logger.info(f"Chat request - User: {current_user.get('uid')}, Conversation: {conversation_id}, Personality: {personality}")
         
@@ -855,7 +909,7 @@ async def chat(
             "Access-Control-Allow-Credentials": "true"
         }
 
-        if not message:
+        if not message and not image_data_url:
             # Defensive: Always return a valid conversation_id
             response = JSONResponse(
                 content={
@@ -898,30 +952,64 @@ async def chat(
                 response.headers[key] = value
             return response
         
-        messages, user_id, profile_id = await _build_chat_messages(message, personality, conversation_id, current_user)
+        if image_data_url:
+            # Image turns are a standalone one-shot exchange, not routed
+            # through _build_chat_messages -- that function (and the whole
+            # conversation-history machinery it feeds) assumes plain string
+            # content everywhere, and mixing in multi-modal content there
+            # would ripple through history-building, RAG injection, and the
+            # A/B variant seam for a feature that doesn't need any of that.
+            user_id = current_user.get('uid')
+            profile_id = current_user.get('profile_id')
+            message = message or "[Image]"
+            try:
+                system_prompt = get_personality_context(personality)[0]["content"]
+                response = await get_groq_vision_response(system_prompt, message, image_data_url)
+                response = clean_llm_response(response)
+                response = str(response).strip() if response else "I'm not sure how to respond to that. Could you rephrase?"
+                response = remove_user_message_references(response, message)
+                persona_name = get_persona_name(personality)
+                if response.lower().startswith(persona_name.lower() + ":"):
+                    response = response[len(persona_name) + 1:].strip()
+                response = remove_meta_references(response)
+            except Exception as e:
+                logger.error(f"Error generating vision response with Groq: {str(e)}")
+                logger.error(traceback.format_exc())
+                response = "Hmm, let me think of a better response. Try asking me something else!"
+        else:
+            messages, user_id, profile_id = await _build_chat_messages(
+                message, personality, conversation_id, current_user, rag_override=use_documents
+            )
 
-        logger.info(f"Prompt sent to LLM (Groq): {json.dumps(messages, ensure_ascii=False, indent=2)}")
-        response = None
-        try:
-            # Get response from Groq
-            response = await get_groq_response(messages)
+            logger.info(f"Prompt sent to LLM (Groq): {json.dumps(messages, ensure_ascii=False, indent=2)}")
+            response = None
+            try:
+                # Local fine-tuned model is opt-in per request (like use_documents)
+                # and falls back to Groq on None -- not configured, no adapter for
+                # this persona, or a generation-time failure all look the same to
+                # the caller: use Groq like every request already does today.
+                response = None
+                if use_finetuned:
+                    response = await generate_finetuned_response(personality, messages)
+                if response is None:
+                    response = await get_groq_response(messages)
 
-            # Clean and validate the response (helpers hoisted to module level,
-            # shared with /chat/stream)
-            response = clean_llm_response(response)
-            response = str(response).strip() if response else "I'm not sure how to respond to that. Could you rephrase?"
-            response = remove_user_message_references(response, message)
-            
-            persona_name = get_persona_name(personality)
-            if response.lower().startswith(persona_name.lower() + ":"):
-                response = response[len(persona_name) + 1:].strip()
-            
-            response = remove_meta_references(response)
-            
-        except Exception as e:
-            logger.error(f"Error generating response with Groq: {str(e)}")
-            logger.error(traceback.format_exc())
-            response = "Hmm, let me think of a better response. Try asking me something else!"
+                # Clean and validate the response (helpers hoisted to module level,
+                # shared with /chat/stream)
+                response = clean_llm_response(response)
+                response = str(response).strip() if response else "I'm not sure how to respond to that. Could you rephrase?"
+                response = remove_user_message_references(response, message)
+
+                persona_name = get_persona_name(personality)
+                if response.lower().startswith(persona_name.lower() + ":"):
+                    response = response[len(persona_name) + 1:].strip()
+
+                response = remove_meta_references(response)
+
+            except Exception as e:
+                logger.error(f"Error generating response with Groq: {str(e)}")
+                logger.error(traceback.format_exc())
+                response = "Hmm, let me think of a better response. Try asking me something else!"
 
         # Store the conversation in Firestore
         message_id = None
@@ -1135,6 +1223,7 @@ async def chat_stream(
     message = data.get("message")
     personality = data.get("personality", "swag")
     conversation_id = data.get("conversation_id")
+    use_documents = bool(data.get("use_documents", False))
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
 
@@ -1155,7 +1244,9 @@ async def chat_stream(
         profile_id = None
 
         try:
-            messages, user_id, profile_id = await _build_chat_messages(message, personality, conversation_id, current_user)
+            messages, user_id, profile_id = await _build_chat_messages(
+                message, personality, conversation_id, current_user, rag_override=use_documents
+            )
 
             async for delta in get_groq_response_stream(messages):
                 buffer += delta
@@ -1487,6 +1578,121 @@ async def get_shared_conversation(token: str):
     )
     turns.reverse()
     return {"success": True, "messages": normalize_turns_to_messages(turns)}
+
+
+ALLOWED_DOCUMENT_EXTENSIONS = (".txt", ".pdf")
+MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB -- generous for a personal-project doc, cheap to raise later
+
+
+@api_app.post("/documents/upload")
+async def upload_document_endpoint(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Chunk, embed, and store an uploaded document for RAG. Explicit user
+    action -- unlike the RAG lookup during chat, failures here raise real
+    errors instead of degrading silently, since the user needs to know if
+    their upload didn't actually work."""
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    effective_user_id = profile_id or user_id
+
+    filename = file.filename or "document"
+    if not filename.lower().endswith(ALLOWED_DOCUMENT_EXTENSIONS):
+        raise HTTPException(status_code=400, detail=f"Only {', '.join(ALLOWED_DOCUMENT_EXTENSIONS)} files are supported.")
+
+    content = await file.read()
+    if len(content) > MAX_DOCUMENT_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (10MB limit).")
+
+    try:
+        result = await upload_document(effective_user_id, filename, content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    await add_document_metadata(profile_id, user_id, result["doc_id"], filename, result["chunk_count"])
+    return {"success": True, "doc_id": result["doc_id"], "filename": filename, "chunk_count": result["chunk_count"]}
+
+
+@api_app.get("/documents")
+async def list_documents_endpoint(current_user: dict = Depends(get_current_user)):
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    docs = await list_documents(profile_id, user_id)
+    return {"success": True, "documents": docs}
+
+
+@api_app.delete("/documents/{doc_id}")
+async def delete_document_endpoint(doc_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    effective_user_id = profile_id or user_id
+
+    deleted_metadata = await delete_document_metadata(profile_id, user_id, doc_id)
+    if not deleted_metadata:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        await delete_document_vectors(effective_user_id, doc_id)
+    except RuntimeError as e:
+        # Metadata is already gone -- the vectors becoming orphaned in
+        # Qdrant if it's briefly unreachable is a much smaller problem than
+        # blocking the user's delete action on a dependency being down.
+        logger.warning(f"Deleted document metadata but Qdrant vector cleanup failed for {doc_id}: {e}")
+
+    return {"success": True}
+
+
+@api_app.get("/experiments/{persona_id}")
+async def get_experiment_stats(persona_id: str, current_user: dict = Depends(get_current_user)):
+    """Aggregated thumbsUp/thumbsDown per prompt variant, across all users,
+    for a given persona -- powers the A/B results view in Settings. No
+    admin gating: this app has no role concept anywhere else, and every
+    other endpoint is scoped by "any authenticated user" the same way."""
+    try:
+        stats = await get_experiment_results(persona_id)
+    except GoogleFailedPrecondition as e:
+        # First-run gap: the collection_group query needs a composite index
+        # that doesn't exist yet. Firestore's own error already contains a
+        # direct console link to create it -- surface that link instead of
+        # a bare 500, since only a manual one-time console click fixes this.
+        logger.error(f"Experiment results query needs a Firestore index: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Experiment results need a one-time Firestore index that hasn't been created yet. "
+                f"Create it here, then retry: {e}"
+            ),
+        )
+    variants = {}
+    for variant, s in stats.items():
+        total_reactions = s['thumbs_up'] + s['thumbs_down']
+        variants[variant] = {
+            **s,
+            # None (not 0) when nobody has reacted yet -- 0% and "no data"
+            # are different things the frontend should render differently.
+            "thumbs_up_rate": round(s['thumbs_up'] / total_reactions, 3) if total_reactions else None,
+        }
+    return {"success": True, "persona_id": persona_id, "variants": variants}
+
+
+@api_app.post("/shared/{token}/continue")
+async def continue_shared_conversation(token: str, current_user: dict = Depends(get_current_user)):
+    """Fork a shared, read-only conversation into the caller's own account
+    so they can keep chatting from where it left off -- copies the turn
+    history rather than writing into the original owner's data."""
+    share = await get_share(token)
+    if not share or share.get('revoked'):
+        raise HTTPException(status_code=404, detail="Share link not found or revoked")
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    new_chat_id, title = await fork_conversation(
+        source_chat_id=share['chat_id'],
+        source_owner_uid=share['owner_uid'],
+        source_profile_id=share.get('profile_id'),
+        dest_user_id=user_id,
+        dest_profile_id=profile_id,
+    )
+    return {"success": True, "conversation_id": new_chat_id, "title": title}
 
 
 from fastapi.exceptions import RequestValidationError
