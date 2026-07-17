@@ -15,8 +15,16 @@ from firebase_memory_manager import (
     get_chat_history,
     get_chat_messages,
     update_chat_title,
-    delete_chat
+    delete_chat,
+    update_message_response,
+    set_message_reaction,
+    create_share_token,
+    get_share,
 )
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 
 # --- GREETING KEYWORDS ---
@@ -60,6 +68,27 @@ api_app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+db = firestore.client()
+
+
+def _rate_limit_key(request: Request) -> str:
+    # Key on the bearer token itself rather than IP (this is an authenticated
+    # API, IP-based limiting would be wrong) or a second Firebase verify call
+    # (the real verification already happens in get_current_user — re-doing
+    # it here just to compute a rate-limit key would double the auth cost
+    # per request for no real benefit, since the token is already unique
+    # per signed-in session).
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(None, 1)[1][:64]
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_limit_key)
+api_app.state.limiter = limiter
+api_app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+api_app.add_middleware(SlowAPIMiddleware)
 
 # Test endpoint to verify CORS is working
 @api_app.get("/test-cors")
@@ -784,8 +813,9 @@ async def _build_chat_messages(message: str, personality: str, conversation_id: 
 # Add new endpoint for conversation management
 @api_app.post("/chat")
 @api_app.options("/chat", include_in_schema=False)
+@limiter.limit("20/minute")
 async def chat(
-    request: Request, 
+    request: Request,
     current_user: dict = Depends(get_current_user),
     origin: str = Header(None, include_in_schema=False)
 ):
@@ -894,8 +924,9 @@ async def chat(
             response = "Hmm, let me think of a better response. Try asking me something else!"
 
         # Store the conversation in Firestore
+        message_id = None
         try:
-            conversation_id = await store_message(
+            conversation_id, message_id = await store_message(
                 user_id=user_id,
                 profile_id=profile_id,
                 personality=personality,
@@ -968,7 +999,8 @@ async def chat(
             "message": response,  # This is the sanitized AI message
             "timestamp": datetime.now().isoformat(),
             "personality": personality,  # Use the personality from the original request
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
+            "message_id": message_id
         }
         
         # Create JSON response
@@ -1076,6 +1108,7 @@ async def chat(
 
 @api_app.post("/chat/stream")
 @api_app.options("/chat/stream", include_in_schema=False)
+@limiter.limit("20/minute")
 async def chat_stream(
     request: Request,
     current_user: dict = Depends(get_current_user),
@@ -1156,9 +1189,10 @@ async def chat_stream(
         # Store the conversation + refresh compressed memory, same as /chat —
         # needs the full accumulated text, so this runs after the stream ends.
         final_conversation_id = conversation_id
-        if user_id and profile_id:
+        final_message_id = None
+        if user_id:
             try:
-                final_conversation_id = await store_message(
+                final_conversation_id, final_message_id = await store_message(
                     user_id=user_id,
                     profile_id=profile_id,
                     personality=personality,
@@ -1187,7 +1221,7 @@ async def chat_stream(
             except Exception as e:
                 logger.warning(f"Failed to summarize and store compressed memory (stream): {str(e)}")
 
-        yield f"data: {json.dumps({'done': True, 'conversation_id': final_conversation_id})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'conversation_id': final_conversation_id, 'message_id': final_message_id})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -1235,61 +1269,29 @@ def _clean_response_sentence(sentence: str, user_message: str, personality: str)
 
 @api_app.put("/conversations/{conversation_id}")
 async def update_conversation(conversation_id: str, request: Request, current_user: dict = Depends(get_current_user)):
-    """Update a conversation's metadata (title, personality, etc.) in Firestore."""
+    """Update a conversation's metadata (title, personality) in Firestore."""
     try:
         data = await request.json()
         title = data.get("title")
         personality = data.get("personality")
-        
+
         if not any([title, personality]):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="At least one field (title or personality) is required"
             )
-        
-        # Get user ID and profile ID from the authenticated user
+
         user_id = current_user.get("uid")
         profile_id = current_user.get("profile_id")
-        
-        # Prepare update data
-        update_data = {
-            'updated_at': firestore.SERVER_TIMESTAMP
-        }
-        if title is not None:
-            update_data['title'] = title
-        if personality is not None:
-            update_data['personality'] = personality
-        
-        # Update the conversation in Firestore
-        db = firestore.client()
-        conversation_ref = db.collection('users').document(profile_id or user_id)\
-                             .collection('conversations').document(conversation_id)
-        
-        # Check if the conversation exists and belongs to the user
-        conversation = await conversation_ref.get()
-        if not conversation.exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Conversation not found"
-            )
-            
-        await conversation_ref.update(update_data)
-        
-        # Get the updated conversation
-        updated_conversation = await conversation_ref.get()
-        
-        return {
-            "success": True,
-            "conversation": {
-                "id": conversation_id,
-                "title": updated_conversation.get("title"),
-                "personality": updated_conversation.get("personality"),
-                "profile_id": profile_id,
-                "user_id": user_id,
-                "updated_at": updated_conversation.get("updated_at").isoformat() if updated_conversation.get("updated_at") else None
-            }
-        }
-        
+
+        ok = await update_chat_title(
+            chat_id=conversation_id, user_id=user_id, title=title, profile_id=profile_id, personality=personality
+        )
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+        return {"success": True, "conversation_id": conversation_id}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1354,6 +1356,138 @@ async def delete_conversation_endpoint(conversation_id: str, current_user: dict 
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete conversation"
         )
+
+def normalize_turns_to_messages(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Turn Firestore's one-doc-per-turn shape ({message, response, ...}) into
+    two frontend-shaped entries per turn (user + assistant), matching the
+    app's existing per-sender bubble model so MessageBubble/FlatList
+    rendering doesn't need to change. message_doc_id is shared by both
+    halves of a turn -- it's what regenerate/reactions reference back to."""
+    out = []
+    for t in turns:
+        ts = t.get('timestamp')
+        if t.get('message'):
+            out.append({
+                "id": f"{t['id']}_user", "message_doc_id": t['id'], "text": t['message'],
+                "sender": "user", "personality": t.get('personality'), "timestamp": ts,
+                "reactions": None,
+            })
+        if t.get('response') is not None:
+            out.append({
+                "id": f"{t['id']}_assistant", "message_doc_id": t['id'], "text": t['response'],
+                "sender": "assistant", "personality": t.get('personality'), "timestamp": ts,
+                "reactions": t.get('reactions'),
+            })
+    return out
+
+
+@api_app.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages_endpoint(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Return the full message history for one conversation, normalized into
+    per-sender entries for the frontend's existing per-bubble rendering."""
+    try:
+        user_id = current_user.get("uid")
+        profile_id = current_user.get("profile_id")
+        turns = await get_chat_messages(
+            chat_id=conversation_id, user_id=user_id, profile_id=profile_id, limit=200
+        )
+        turns.reverse()  # get_chat_messages returns DESCENDING; UI wants ascending
+        return {"success": True, "conversation_id": conversation_id, "messages": normalize_turns_to_messages(turns)}
+    except Exception as e:
+        logger.error(f"Error fetching conversation messages: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch conversation messages")
+
+
+class RegenerateRequest(BaseModel):
+    message_id: str  # the message_doc_id from the /messages endpoint's response
+
+
+@api_app.post("/conversations/{conversation_id}/regenerate")
+async def regenerate_message(
+    conversation_id: str, body: RegenerateRequest, current_user: dict = Depends(get_current_user)
+):
+    """Re-run the LLM for a turn's stored user message and overwrite that
+    same turn's response in place (not a new doc) -- v1 is non-streaming,
+    a single fetch + spinner is enough for a last-message-only action."""
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    effective_user_id = profile_id or user_id
+    msg_ref = (
+        db.collection('users').document(effective_user_id).collection('chats')
+        .document(conversation_id).collection('messages').document(body.message_id)
+    )
+    doc = msg_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Message not found")
+    turn = doc.to_dict()
+    user_text, personality = turn.get('message'), turn.get('personality', 'swag')
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Turn has no user message to regenerate a response for")
+
+    messages, _, _ = await _build_chat_messages(user_text, personality, conversation_id, current_user)
+    try:
+        raw = await get_groq_response(messages)
+        response = clean_llm_response(raw)
+        response = remove_user_message_references(str(response).strip(), user_text)
+        response = remove_meta_references(response)
+    except Exception as e:
+        logger.error(f"Error regenerating response: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to regenerate response")
+
+    ok = await update_message_response(conversation_id, body.message_id, user_id, profile_id, response)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to store regenerated response")
+    return {"success": True, "message_id": body.message_id, "response": response}
+
+
+class ReactionRequest(BaseModel):
+    thumbs_up: bool = False
+    thumbs_down: bool = False
+
+
+@api_app.post("/conversations/{conversation_id}/messages/{message_id}/react")
+async def react_to_message(
+    conversation_id: str, message_id: str, body: ReactionRequest, current_user: dict = Depends(get_current_user)
+):
+    """Idempotent reaction set -- toggling off is just both flags False."""
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    ok = await set_message_reaction(conversation_id, message_id, user_id, profile_id, body.thumbs_up, body.thumbs_down)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Message not found or reaction failed")
+    return {"success": True}
+
+
+@api_app.post("/conversations/{conversation_id}/share")
+async def share_conversation(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Mint a public, read-only share token for a conversation (owner-only)."""
+    user_id = current_user.get("uid")
+    profile_id = current_user.get("profile_id")
+    effective_user_id = profile_id or user_id
+    chat_doc = db.collection('users').document(effective_user_id).collection('chats').document(conversation_id).get()
+    if not chat_doc.exists:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    token = await create_share_token(conversation_id, user_id, profile_id)
+    return {"success": True, "token": token, "url": f"/shared/{token}"}
+
+
+@api_app.get("/shared/{token}")
+async def get_shared_conversation(token: str):
+    """The one deliberately public endpoint -- no auth. Scoped entirely by
+    the share doc's stored owner_uid/profile_id, not the caller's identity."""
+    share = await get_share(token)
+    if not share or share.get('revoked'):
+        raise HTTPException(status_code=404, detail="Share link not found or revoked")
+    turns = await get_chat_messages(
+        chat_id=share['chat_id'], user_id=share['owner_uid'], profile_id=share.get('profile_id'), limit=200
+    )
+    turns.reverse()
+    return {"success": True, "messages": normalize_turns_to_messages(turns)}
+
 
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse

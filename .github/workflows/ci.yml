@@ -1,0 +1,40 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test -- --ci
+      - run: npm run build
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r api/requirements.txt
+      # firebase_auth.py initializes the Firebase Admin SDK at import time,
+      # so a real (or CI-only) service account is required just to import
+      # the app. Add a repo secret named FIREBASE_SERVICE_ACCOUNT_JSON
+      # containing the full service account JSON for this to run --
+      # without it, this step (and the whole backend job) will fail.
+      - name: Write Firebase service account
+        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' > api/serviceAccountKey.json
+      - name: Run backend tests
+        working-directory: api
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: serviceAccountKey.json
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: pytest -v

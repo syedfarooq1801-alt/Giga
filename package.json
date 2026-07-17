@@ -13,7 +13,19 @@
     "prestart": "npm run generate-favicon",
     "prebuild": "npm run generate-favicon",
     "postinstall": "patch-package",
-    "preview": "node scripts/local-dev-server.js"
+    "preview": "node scripts/local-dev-server.js",
+    "test": "jest"
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "moduleNameMapper": {},
+    "modulePathIgnorePatterns": [
+      "<rootDir>/gigabhai-frontend/",
+      "<rootDir>/gigabhai-backend/"
+    ],
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@unimodules/.*|unimodules|sentry-expo|native-base|react-native-svg|react-native-markdown-display)"
+    ]
   },
   "dependencies": {
     "@expo/metro-runtime": "~3.1.3",
@@ -46,6 +58,7 @@
     "react-dom": "^18.3.1",
     "react-native": "0.73.6",
     "react-native-gesture-handler": "~2.14.0",
+    "react-native-markdown-display": "^7.0.2",
     "react-native-reanimated": "~3.6.2",
     "react-native-safe-area-context": "4.8.2",
     "react-native-screens": "~3.29.0",
@@ -61,6 +74,7 @@
   },
   "devDependencies": {
     "@babel/core": "^7.20.0",
+    "@testing-library/react-native": "^12.9.0",
     "@types/node": "^22.15.18",
     "@types/react": "~18.2.45",
     "@types/react-native": "^0.73.0",
@@ -73,13 +87,16 @@
     "buffer": "^6.0.3",
     "crypto-browserify": "^3.12.1",
     "eslint": "^9.28.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "image-size": "^2.0.2",
+    "jest-expo": "~50.0.4",
     "metro-minify-terser": "^0.82.3",
     "null-loader": "^4.0.1",
     "patch-package": "^8.0.0",
     "path-browserify": "^1.0.1",
     "postinstall-postinstall": "^2.1.0",
     "process": "^0.11.10",
+    "react-test-renderer": "^18.2.0",
     "sharp": "^0.34.2",
     "stream-browserify": "^3.0.0",
     "typescript": "~5.8.3",

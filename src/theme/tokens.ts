@@ -52,6 +52,10 @@ export const TYPOGRAPHY = {
   },
   size: { xs: 12, sm: 14, base: 16, md: 18, lg: 20, xl: 24, xxl: 32 },
   letterSpacingTight: -0.5,
+  monoFontFamily: Platform.select({
+    web: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    default: 'monospace',
+  }) as string,
 };
 
 // Subtle, accent-only persona theming: the shell (paper/surface/ink) never

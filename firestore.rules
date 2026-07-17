@@ -1,7 +1,32 @@
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // profile_id / user path segments are shaped "{uid}_{providerId}"
+    // (see src/contexts/FirebaseAuthContext.tsx, src/hooks/useAuth.ts),
+    // so a plain request.auth.uid == pathUserId check never matches.
+    function isOwner(pathUserId) {
+      return request.auth != null
+        && pathUserId.matches('^' + request.auth.uid + '_.*$');
+    }
+
+    match /users/{pathUserId}/{document=**} {
+      allow read, write: if isOwner(pathUserId);
+    }
+
+    match /profiles/{profileId} {
+      allow read, write: if isOwner(profileId);
+    }
+
+    // Public, read-only, revocation-checked share links. Written only by
+    // the backend via the Admin SDK (bypasses these rules entirely), so
+    // no client write path needs to be opened here.
+    match /shared_conversations/{shareToken} {
+      allow read: if resource.data.revoked == false;
+      allow write: if false;
+    }
+
     match /{document=**} {
-      allow read, write: if true; // WARNING: This is insecure for production, but enables all Firestore access for development
+      allow read, write: if false;
     }
   }
 }

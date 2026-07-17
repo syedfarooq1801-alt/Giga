@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { API_URL } from '../constants';
 import { speechToText, startSpeechRecognition, stopSpeechRecognition, isRecognitionActive } from '../utils/speechRecognition';
 import type { FC } from 'react';
@@ -16,7 +16,8 @@ import {
   KeyboardAvoidingView,
   Modal,
   Pressable,
-  Image
+  Image,
+  Alert
 } from 'react-native';
 
 
@@ -31,97 +32,11 @@ import { TypingBubble } from '../components/TypingBubble';
 import { ChatHeader } from '../components/chat/ChatHeader';
 import { getPersonaAccent } from '../theme/tokens';
 import { sendMessageToBackendStream } from '../services/chatStream';
-import { getFirestore, collection, query, where, getDocs, addDoc, updateDoc, orderBy, doc, serverTimestamp, setDoc, getDoc, onSnapshot, DocumentData, QueryDocumentSnapshot, limit } from 'firebase/firestore';
-
-// Load messages from Firestore for the given conversation
-// Loads ALL messages for a conversation, including both user and bot (AI) messages, sorted by timestamp ascending. No filtering on sender.
-const loadMessagesFromFirestore = async (profileId: string, conversationId: string): Promise<ChatMessage[]> => {
-  if (!profileId || !conversationId) {
-    console.log('[loadMessagesFromFirestore] Missing profileId or conversationId');
-    return [];
-  }
-
-  console.log(`[loadMessagesFromFirestore] Attempting to load messages for profile: ${profileId}, conversation: ${conversationId}`);
-
-  try {
-    const db = getFirestore();
-    const messagesRef = collection(db, 'users', profileId, 'conversations', conversationId, 'messages');
-    console.log(`[loadMessagesFromFirestore] Messages ref path: users/${profileId}/conversations/${conversationId}/messages`);
-    
-    // Query all messages, regardless of sender (user or bot), sorted by timestamp ascending
-    const q = query(
-      messagesRef,
-      orderBy('timestamp', 'asc')
-    );
-    
-    console.log('[loadMessagesFromFirestore] Executing Firestore query...');
-    const querySnapshot = await getDocs(q);
-    
-    if (querySnapshot.empty) {
-      console.log('[loadMessagesFromFirestore] No messages found in this conversation');
-      return [];
-    }
-    
-    const messages: ChatMessage[] = [];
-    const messageMap = new Map<string, ChatMessage>();
-    
-    querySnapshot.forEach((doc) => {
-      try {
-        const data = doc.data();
-        if (!data) {
-          console.warn(`[loadMessagesFromFirestore] Document ${doc.id} has no data`);
-          return;
-        }
-        
-        // Skip if we've already seen this message ID (shouldn't happen, but just in case)
-        if (messageMap.has(doc.id)) {
-          console.log(`[loadMessagesFromFirestore] Duplicate message ID ${doc.id} found, skipping`);
-          return;
-        }
-        
-        const message: ChatMessage = {
-          id: doc.id,
-          text: data.text || '',
-          userId: data.userId || 'unknown',
-          sender: data.sender || 'user',
-          timestamp: data.timestamp?.toDate() || new Date(),
-          conversationId: conversationId,
-          personalityId: data.personalityId || 'default',
-          profileId: data.profileId || profileId,
-        };
-        
-        // Add to map to ensure no duplicates by ID
-        messageMap.set(doc.id, message);
-      } catch (docError) {
-        console.error(`[loadMessagesFromFirestore] Error processing document ${doc.id}:`, docError);
-      }
-    });
-
-    // Convert map values to array
-    const uniqueMessages = Array.from(messageMap.values());
-    
-    // Sort by timestamp to ensure proper message order
-    uniqueMessages.sort((a, b) => {
-      const tsA = a.timestamp instanceof Date ? a.timestamp.getTime() : new Date(a.timestamp).getTime();
-      const tsB = b.timestamp instanceof Date ? b.timestamp.getTime() : new Date(b.timestamp).getTime();
-      return tsA - tsB;
-    });
-
-    console.log(`[loadMessagesFromFirestore] Successfully loaded ${uniqueMessages.length} messages for conversation ${conversationId}`);
-    return uniqueMessages;
-  } catch (error) {
-    console.error('[loadMessagesFromFirestore] Error loading messages:', error);
-    // Return empty array on error to prevent breaking the UI
-    return [];
-  }
-};
-
-import { getFirebaseAuth, getFirebaseFirestore } from '../utils/initFirebase';
 import { getAuth } from 'firebase/auth';
 import { getConversationTitleFromMistral } from '../utils/mistralTitle';
 import { PersonalityType } from '../types/chat';
 import { Conversation } from '../types/Conversation';
-import { ChatMessage } from '../types/ChatMessage';
+import { ChatMessage, BackendMessage, mapBackendMessageToChatMessage } from '../types/ChatMessage';
 import { RootStackParamList } from '../types/navigation';
 
 type ChatScreenNavigationProp = StackNavigationProp<RootStackParamList, 'Chat'>;
@@ -174,24 +89,6 @@ const saveCurrentConversationToStorage = async (profileId: string, conversation:
   } catch (error) {
     console.error('Failed to save current conversation to AsyncStorage:', error);
   }
-};
-
-const loadCurrentConversationFromStorage = async (profileId: string): Promise<Conversation | null> => {
-  if (!profileId) return null;
-  const key = `${ASYNC_STORAGE_CURRENT_CONVERSATION_KEY_PREFIX}${profileId}`;
-  try {
-    const storedConversation = await AsyncStorage.getItem(key);
-    if (storedConversation) {
-      const conversation = JSON.parse(storedConversation) as Conversation;
-      if (conversation && conversation.id) {
-        console.log('Loaded current conversation from AsyncStorage:', conversation.id);
-        return conversation;
-      }
-    }
-  } catch (error) {
-    console.error('Failed to load current conversation from AsyncStorage:', error);
-  }
-  return null;
 };
 
 
@@ -248,6 +145,7 @@ const sendMessageToBackendAndGetResponse = async (
     const backendConversationId = data.conversation_id;
     const aiMessage: ChatMessage = {
       id: data.message_id || uuidv4(), // Prefer backend message ID if available
+      messageDocId: data.message_id,
       userId: 'ai',
       text: data.message,
       sender: 'assistant',
@@ -291,6 +189,7 @@ const ChatScreen = () => {
   // Track processed message IDs to prevent duplicates
   const processedMessageIds = useRef<Set<string>>(new Set());
   const [isTyping, setIsTyping] = useState(false);
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [isTtsPlaying, setIsTtsPlaying] = useState(false);
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
@@ -319,35 +218,31 @@ const ChatScreen = () => {
 
   // Derive profileId and userId from session
   useEffect(() => {
-    // Loads all conversations for the profile and sets the most recent as current
+    // Loads the user's conversations from the backend (single source of
+    // truth -- the old direct-Firestore-write path here was disconnected
+    // from what the backend actually persists) and sets the most recent as current.
     const restoreLastConversation = async (profileId: string) => {
       try {
-        const db = getFirestore();
-        const convQuery = query(
-          collection(db, 'users', profileId, 'conversations'),
-          orderBy('last_message_timestamp', 'desc')
-        );
-        const snapshot = await getDocs(convQuery);
-        if (snapshot.empty) {
+        const authInstance = getAuth();
+        const idToken = await authInstance.currentUser?.getIdToken();
+        const res = await fetch(`${API_URL}/api/conversations`, {
+          headers: { Authorization: `Bearer ${idToken}` },
+        });
+        if (!res.ok) throw new Error(`Backend error: ${res.status}`);
+        const data = await res.json();
+        const fetched: Conversation[] = (data.conversations || []).map((c: any) => ({
+          id: c.id,
+          title: c.title || 'Untitled',
+          lastMessage: c.last_message || '',
+          timestamp: c.last_message_time ? new Date(c.last_message_time) : new Date(),
+          personalityId: c.personality || DEFAULT_PERSONALITY_ID,
+        }));
+        setConversations(fetched);
+        if (fetched.length === 0) {
           console.log('[ChatScreen] No conversations found for profile. Will create new conversation on first message.');
-          setConversations([]);
           setCurrentConversation(null);
         } else {
-          // Each conversation must have all required Conversation fields
-          const conversations = snapshot.docs.map(docSnap => {
-            const data = docSnap.data();
-            return {
-              id: docSnap.id,
-              title: data.title || 'Untitled',
-              lastMessage: data.lastMessage || '',
-              timestamp: data.timestamp || data.last_message_timestamp || new Date().toISOString(),
-              personalityId: data.personalityId || DEFAULT_PERSONALITY_ID,
-              ...data // Keep other properties if present
-            };
-          });
-          setConversations(conversations);
-          console.log('[ChatScreen] Loaded conversations:', conversations);
-          setCurrentConversation(conversations[0]); // Set most recent as current
+          setCurrentConversation(fetched[0]); // Set most recent as current
         }
       } catch (error) {
         console.error('[ChatScreen] Error loading conversations:', error);
@@ -371,57 +266,23 @@ const ChatScreen = () => {
     setIsOnline(state.isConnected ?? false);
   };
 
-  const createNewConversation = async (initialMessage?: ChatMessage): Promise<Conversation | null> => {
-    if (!profileId || !selectedPersonality) {
-      console.error('Profile ID or selected personality missing for new conversation');
-      return null;
-    }
-    setIsLoadingMessages(true);
-    try {
-      const db = getFirestore();
-      // Prepare first 5 messages for title
-      let firstMessages: { text: string }[] = [];
-      if (initialMessage) {
-        firstMessages = [initialMessage];
-      }
-      // Call Mistral for title if we have at least one message
-      let title = initialMessage?.text ? initialMessage.text.substring(0, 30) : `New ${selectedPersonality.name} Chat`;
-      if (firstMessages.length > 0) {
-        const mistralTitle = await getConversationTitleFromMistral(firstMessages);
-        if (mistralTitle && mistralTitle.trim().length > 0) {
-          title = mistralTitle;
-        }
-      }
-      const newConversationData = {
-        profile_id: profileId,
-        personality_id: selectedPersonality.id,
-        last_message_timestamp: initialMessage?.timestamp || new Date().toISOString(),
-        title,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      const docRef = await addDoc(collection(db, 'users', profileId, 'conversations'), newConversationData);
-
-      // Map to Conversation type
-      const conversation: Conversation = {
-        id: docRef.id,
-        title: newConversationData.title,
-        lastMessage: initialMessage?.text || '',
-        timestamp: initialMessage?.timestamp
-          ? (typeof initialMessage.timestamp === 'string' ? new Date(initialMessage.timestamp) : initialMessage.timestamp)
-          : new Date(),
-        personalityId: selectedPersonality.id,
-        // Add other required fields if your Conversation type/interface expects them
-      };
-      setCurrentConversation(conversation);
-      // saveCurrentConversationToStorage is handled by the useEffect watching currentConversation
-      return conversation;
-    } catch (error) {
-      console.error('Error creating new conversation:', error);
-      return null;
-    } finally {
-      setIsLoadingMessages(false);
-    }
+  // Local-only: resets state to a fresh, not-yet-persisted conversation.
+  // No Firestore write, no backend call -- the backend creates the real
+  // chat doc lazily on the first /chat or /chat/stream call for it (both
+  // already handle conversation_id being empty/undefined). id: '' is the
+  // "not yet created server-side" sentinel; handleSendMessage passes
+  // undefined instead of '' to the backend and adopts whatever id comes back.
+  const createNewConversation = (): Conversation => {
+    const conversation: Conversation = {
+      id: '',
+      title: `New ${selectedPersonality.name} Chat`,
+      lastMessage: '',
+      timestamp: new Date(),
+      personalityId: selectedPersonality.id,
+    };
+    setMessages([]);
+    setCurrentConversation(conversation);
+    return conversation;
   };
 
   const handleSendMessage = async (text: string) => {
@@ -433,21 +294,11 @@ const ChatScreen = () => {
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const now = new Date();
 
-    // Ensure we have a conversation
-    let conversationToUse = currentConversation;
-    if (!conversationToUse) {
-      console.log('No current conversation, creating a new one...');
-      const newConv = await createNewConversation();
-      if (!newConv) {
-        console.error('Failed to create a new conversation');
-        return;
-      }
-      conversationToUse = newConv;
-      setCurrentConversation(newConv);
-    }
-    
+    // Ensure we have a conversation (id may be '' -- not yet created server-side)
+    let conversationToUse = currentConversation ?? createNewConversation();
+
     const convId = conversationToUse.id;
-    console.log('Using conversation ID:', convId);
+    console.log('Using conversation ID:', convId || '(new, not yet created)');
 
     // Create temporary user message for optimistic update
     const tempUserMessage: ChatMessage = {
@@ -494,50 +345,19 @@ const ChatScreen = () => {
     }, 100);
 
     try {
-      // Save the user message to Firestore
-      const userMessageData: Omit<ChatMessage, 'id'> = {
-        text: text.trim(),
-        userId,
-        sender: 'user',
-        timestamp: now,
-        personalityId: selectedPersonality.id,
-        profileId,
-        conversationId: convId
-      };
-
-      const db = getFirestore();
-      const userMsgDoc = await addDoc(
-        collection(db, 'users', profileId, 'conversations', convId, 'messages'),
-        userMessageData
-      );
-
-      // Create the final user message with the Firestore ID
-      const userMessage: ChatMessage = {
-        ...userMessageData,
-        id: userMsgDoc.id
-      };
-
-      // Update state with the real user message (replacing the temp one)
-      setMessages(prev => {
-        // Remove both the temporary message and any duplicate that might have come from Firestore
-        const filtered = prev.filter(msg =>
-          msg.id !== tempId &&
-          !(msg.sender === 'user' && msg.text === userMessage.text && msg.id !== userMessage.id)
-        );
-        return [...filtered, userMessage];
-      });
-
-      // Mark this message as processed to prevent duplicates
-      processedMessageIds.current.add(userMessage.id);
+      // The user's message is no longer written to Firestore directly from
+      // here -- the backend persists both sides of the turn (via
+      // store_message inside /chat and /chat/stream) as the single source
+      // of truth. tempUserMessage IS userMessage; its messageDocId gets
+      // filled in once the backend responds with the turn's doc id.
+      const userMessage = tempUserMessage;
 
       // Send to backend and get AI response.
       // Web: stream the reply in sentence chunks. Native: wait for the full
       // response (RN's fetch doesn't reliably support ReadableStream yet).
       if (Platform.OS === 'web') {
         const streamId = `stream-${Date.now()}`;
-        const userTs = userMessage.timestamp instanceof Date
-          ? userMessage.timestamp.getTime()
-          : new Date(userMessage.timestamp).getTime();
+        const userTs = userMessage.timestamp.getTime();
         const streamPlaceholder: ChatMessage = {
           id: streamId,
           text: '',
@@ -573,24 +393,31 @@ const ChatScreen = () => {
 
           if (streamResult) {
             const finalText = streamResult.fullText || 'Sorry, the AI could not generate a response.';
+            const finalConvId = streamResult.conversationId || convId;
             setMessages(prev => {
               const withoutPlaceholder = prev.filter(msg => msg.id !== streamId);
-              return [...withoutPlaceholder, { ...streamPlaceholder, text: finalText }];
+              return withoutPlaceholder.map(msg =>
+                msg.id === tempId
+                  ? { ...msg, messageDocId: streamResult.messageId || undefined, conversationId: finalConvId }
+                  : msg
+              ).concat({
+                ...streamPlaceholder,
+                text: finalText,
+                messageDocId: streamResult.messageId || undefined,
+                conversationId: finalConvId,
+              });
             });
             processedMessageIds.current.add(streamId);
 
-            if (streamResult.conversationId && streamResult.conversationId !== convId) {
-              conversationToUse = { ...conversationToUse, id: streamResult.conversationId };
-              setCurrentConversation(conversationToUse);
+            if (finalConvId !== convId) {
+              conversationToUse = { ...conversationToUse, id: finalConvId };
             }
-            if (currentConversation) {
-              setCurrentConversation({
-                ...currentConversation,
-                lastMessage: finalText,
-                timestamp: streamPlaceholder.timestamp,
-                personalityId: selectedPersonality.id,
-              });
-            }
+            setCurrentConversation({
+              ...conversationToUse,
+              lastMessage: finalText,
+              timestamp: streamPlaceholder.timestamp,
+              personalityId: selectedPersonality.id,
+            });
           }
         } catch (streamError) {
           console.error('Error streaming message:', streamError);
@@ -620,9 +447,7 @@ const ChatScreen = () => {
         }
 
         // Ensure bot timestamp is after user message
-        const userTs = userMessage.timestamp instanceof Date
-          ? userMessage.timestamp.getTime()
-          : new Date(userMessage.timestamp).getTime();
+        const userTs = userMessage.timestamp.getTime();
 
         let aiTs = aiMessage.timestamp instanceof Date
           ? aiMessage.timestamp.getTime()
@@ -637,31 +462,29 @@ const ChatScreen = () => {
         // Update the conversation ID if it was changed (e.g., new conversation created)
         if (returnedConversationId !== convId) {
           console.log(`[handleSendMessage] Conversation ID updated from ${convId} to ${returnedConversationId}`);
-          // Update the conversation ID for any subsequent messages
           conversationToUse = { ...conversationToUse, id: returnedConversationId };
-          setCurrentConversation(conversationToUse);
         }
 
-        // Add the AI message to the conversation
+        // Add the AI message, and attach the same messageDocId to the user's
+        // message (both halves of one turn share a single backend doc id).
         setMessages(prev => {
-          // Filter out any existing AI messages with the same ID
           const filtered = prev.filter(msg => msg.id !== aiMessage.id);
-          return [...filtered, aiMessage];
+          return filtered.map(msg =>
+            msg.id === tempId
+              ? { ...msg, messageDocId: aiMessage.messageDocId, conversationId: returnedConversationId }
+              : msg
+          ).concat(aiMessage);
         });
 
         // Mark AI message as processed
         processedMessageIds.current.add(aiMessage.id);
 
-        // Update currentConversation state with the new message
-        if (currentConversation) {
-          const updatedConv: Conversation = {
-            ...currentConversation,
-            lastMessage: aiMessage.text,
-            timestamp: aiMessage.timestamp,
-            personalityId: aiMessage.personalityId,
-          };
-          setCurrentConversation(updatedConv);
-        }
+        setCurrentConversation({
+          ...conversationToUse,
+          lastMessage: aiMessage.text,
+          timestamp: aiMessage.timestamp,
+          personalityId: aiMessage.personalityId,
+        });
 
         // Stop the typing indicator as soon as we've processed the AI message
         setIsTyping(false);
@@ -681,6 +504,76 @@ const ChatScreen = () => {
     }
   };
 
+  // Regenerate/reactions only make sense on the most recent assistant reply.
+  const lastAssistantId = useMemo(() => {
+    const assistantMessages = messages.filter(m => m.sender === 'assistant');
+    return assistantMessages.length > 0 ? assistantMessages[assistantMessages.length - 1].id : null;
+  }, [messages]);
+
+  const handleReact = async (msg: ChatMessage, thumbsUp: boolean, thumbsDown: boolean) => {
+    if (!currentConversation?.id || !msg.messageDocId) return;
+    setMessages(prev => prev.map(m => (m.id === msg.id ? { ...m, reactions: { thumbsUp, thumbsDown } } : m)));
+    try {
+      const idToken = await getAuth().currentUser?.getIdToken();
+      await fetch(`${API_URL}/api/conversations/${currentConversation.id}/messages/${msg.messageDocId}/react`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ thumbs_up: thumbsUp, thumbs_down: thumbsDown }),
+      });
+    } catch (error) {
+      console.error('Error reacting to message:', error);
+    }
+  };
+
+  const handleRegenerate = async (msg: ChatMessage) => {
+    if (!currentConversation?.id || !msg.messageDocId) return;
+    setRegeneratingId(msg.id);
+    try {
+      const idToken = await getAuth().currentUser?.getIdToken();
+      const res = await fetch(`${API_URL}/api/conversations/${currentConversation.id}/regenerate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ message_id: msg.messageDocId }),
+      });
+      if (!res.ok) throw new Error(`Backend error: ${res.status}`);
+      const data = await res.json();
+      if (data.success) {
+        setMessages(prev => prev.map(m => (m.id === msg.id ? { ...m, text: data.response } : m)));
+      }
+    } catch (error) {
+      console.error('Error regenerating message:', error);
+      Alert.alert('Error', 'Failed to regenerate response. Please try again.');
+    } finally {
+      setRegeneratingId(null);
+    }
+  };
+
+  const handleShare = async () => {
+    if (!currentConversation?.id) return;
+    try {
+      const idToken = await getAuth().currentUser?.getIdToken();
+      const res = await fetch(`${API_URL}/api/conversations/${currentConversation.id}/share`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.ok) throw new Error(`Backend error: ${res.status}`);
+      const data = await res.json();
+      const fullUrl = Platform.OS === 'web' && typeof window !== 'undefined'
+        ? `${window.location.origin}${data.url}`
+        : data.url;
+
+      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
+        await navigator.clipboard.writeText(fullUrl);
+        Alert.alert('Link copied', 'Share link copied to clipboard.');
+      } else {
+        Alert.alert('Share link', fullUrl);
+      }
+    } catch (error) {
+      console.error('Error sharing conversation:', error);
+      Alert.alert('Error', 'Failed to create share link. Please try again.');
+    }
+  };
+
   const loadMessages = useCallback(async () => {
     if (!profileId || !currentConversation?.id) {
       setMessages([]);
@@ -688,47 +581,45 @@ const ChatScreen = () => {
     }
     setIsLoadingMessages(true);
     try {
-      const db = getFirestore();
-      const q = query(
-        collection(db, 'users', profileId, 'messages'),
-        where('conversation_id', '==', currentConversation.id),
-        orderBy('timestamp', 'asc')
+      const authInstance = getAuth();
+      const idToken = await authInstance.currentUser?.getIdToken();
+      const res = await fetch(`${API_URL}/api/conversations/${currentConversation.id}/messages`, {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.ok) throw new Error(`Backend error: ${res.status}`);
+      const data = await res.json();
+      const fetched: ChatMessage[] = (data.messages || []).map((m: BackendMessage) =>
+        mapBackendMessageToChatMessage(m, userId || '', profileId, currentConversation.id)
       );
-      const querySnapshot = await getDocs(q);
-      const firebaseMessages: ChatMessage[] = querySnapshot.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as ChatMessage));
 
       setMessages(prevMessagesInState => {
         if (!currentConversation?.id) return [];
-        // Identify optimistic messages in the current state that belong to the *current* conversation
-        // and are not yet present in the messages fetched from Firestore.
-        const optimisticMessagesForCurrentConv = prevMessagesInState.filter(
-          msg => msg.conversationId === currentConversation.id &&
-            !firebaseMessages.find(fm => fm.id === msg.id)
+        // Keep any still-in-flight optimistic messages for this conversation
+        // that the backend fetch doesn't have yet (e.g. a send in progress).
+        const optimisticForCurrentConv = prevMessagesInState.filter(
+          msg => msg.conversationId === currentConversation.id && msg.isOptimistic &&
+            !fetched.find(fm => fm.text === msg.text && fm.sender === msg.sender)
         );
 
-        // Combine Firestore messages with these optimistic ones.
-        const newMessagesToShow = [...firebaseMessages, ...optimisticMessagesForCurrentConv];
-
-        // Sort all messages by timestamp to ensure correct order.
+        const newMessagesToShow = [...fetched, ...optimisticForCurrentConv];
         newMessagesToShow.sort((a, b) => {
           const tsA = a.timestamp instanceof Date ? a.timestamp.getTime() : new Date(a.timestamp).getTime();
           const tsB = b.timestamp instanceof Date ? b.timestamp.getTime() : new Date(b.timestamp).getTime();
           if (tsA !== tsB) return tsA - tsB;
-          // If timestamps are equal, user comes before bot
           if (a.sender === 'user' && b.sender === 'assistant') return -1;
           if (a.sender === 'assistant' && b.sender === 'user') return 1;
           return 0;
         });
         return newMessagesToShow;
       });
-      console.log('Loaded messages from Firestore:', firebaseMessages.length);
+      console.log('Loaded messages from backend:', fetched.length);
     } catch (error) {
-      console.error('Error loading messages from Firestore:', error);
+      console.error('Error loading messages:', error);
       setMessages([]);
     } finally {
       setIsLoadingMessages(false);
     }
-  }, [profileId, currentConversation]);
+  }, [profileId, userId, currentConversation]);
 
   // Effect to load messages when profileId or currentConversation changes
   useEffect(() => {
@@ -753,60 +644,6 @@ const ChatScreen = () => {
       flatListRef.current.scrollToEnd({ animated: true });
     }
   }, [messages]);
-
-  // TODO: Implement loadConversations and integrate with History Modal
-  const loadConversations = async () => {
-    if (!profileId) return;
-    console.log('Loading conversations for profile:', profileId);
-    try {
-      const db = getFirestore();
-      const q = query(
-        collection(db, 'users', profileId, 'conversations'),
-        orderBy('last_message_timestamp', 'desc')
-      );
-      const querySnapshot = await getDocs(q);
-      const conversations: Conversation[] = querySnapshot.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as Conversation));
-      // setConversations(conversations); // Uncomment if you have a conversations state
-      if (conversations && conversations.length > 0 && !currentConversation) {
-        setCurrentConversation(conversations[0]); // Auto-select the latest conversation
-      }
-    } catch (error) {
-      console.error('Error loading conversations:', error);
-    }
-  };
-
-  // Effect to load or create conversation when profileId is available
-  useEffect(() => {
-    const initializeConversation = async () => {
-      if (profileId && !currentConversation) {
-        console.log('Profile ID available, attempting to load or create conversation.');
-        let loadedConversation = await loadCurrentConversationFromStorage(profileId);
-        if (loadedConversation && loadedConversation.id) {
-          // Validate with Firestore to ensure it's not stale/deleted
-          const db = getFirestore();
-          const convRef = doc(db, 'users', profileId, 'conversations', loadedConversation.id);
-          const convSnap = await getDoc(convRef);
-          if (convSnap.exists()) {
-            console.log('Setting current conversation from AsyncStorage (validated):', loadedConversation.id);
-            setCurrentConversation(loadedConversation);
-          } else {
-            console.log('Conversation from AsyncStorage not found in Firestore, creating new one.');
-            loadedConversation = null; // Treat as not loaded
-            await saveCurrentConversationToStorage(profileId, null); // Clear stale entry
-          }
-        }
-
-        if (!loadedConversation) { // If not loaded or was stale
-          console.log('No valid conversation in AsyncStorage or was stale, creating new one.');
-          const newConv = await createNewConversation(); // createNewConversation should call setCurrentConversation & save
-          if (!newConv) {
-            console.log('Could not auto-create a conversation on load.');
-          }
-        }
-      }
-    };
-    initializeConversation();
-  }, [profileId, currentConversation]); // currentConversation is included to re-run if it gets nulled externally
 
   // Effect to save currentConversation to AsyncStorage whenever it changes
   useEffect(() => {
@@ -1466,6 +1303,7 @@ const ChatScreen = () => {
         selectedPersonality={selectedPersonality}
         onSelectPersonality={handlePersonalitySelect}
         isDefaultPersonality={selectedPersonality.id === DEFAULT_PERSONALITY_ID}
+        onShare={currentConversation?.id ? handleShare : undefined}
       />
       {!isOnline && (
         <View style={styles.networkStatusBar}>
@@ -1496,6 +1334,11 @@ const ChatScreen = () => {
               sender={item.sender}
               personalityEmoji={item.sender === 'assistant' && PERSONALITIES[item.personalityId || 'default']?.emoji ? PERSONALITIES[item.personalityId || 'default'].emoji : undefined}
               accentColor={accentColor}
+              reactions={item.reactions}
+              onReact={item.sender === 'assistant' && item.messageDocId ? (up, down) => handleReact(item, up, down) : undefined}
+              isLastAssistantMessage={item.sender === 'assistant' && item.id === lastAssistantId}
+              onRegenerate={item.messageDocId ? () => handleRegenerate(item) : undefined}
+              isRegenerating={regeneratingId === item.id}
             />
           );
         }}
@@ -1596,13 +1439,10 @@ const ChatScreen = () => {
             <TouchableOpacity
               style={[styles.personalityItem, { opacity: messages.length === 0 ? 0.5 : 1 }]}
               disabled={messages.length === 0}
-              onPress={async () => {
+              onPress={() => {
                 if (messages.length === 0) return;
-                const newConvo = await createNewConversation();
-                if (newConvo) {
-                  setCurrentConversation(newConvo);
-                  setShowHistoryModal(false);
-                }
+                createNewConversation();
+                setShowHistoryModal(false);
               }}
             >
               <MaterialCommunityIcons name="plus" size={22} color={messages.length === 0 ? colors.sub : accentColor} />

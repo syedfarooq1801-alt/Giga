@@ -1,12 +1,13 @@
 import React from 'react';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, LinkingOptions } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import ChatScreen from '../screens/ChatScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { GigsScreen } from '../screens/GigsScreen';
 import AuthScreen from '../screens/AuthScreen';
+import { SharedConversationScreen } from '../screens/SharedConversationScreen';
 import { useAuth } from '../contexts/FirebaseAuthContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
@@ -14,6 +15,7 @@ import { Ionicons } from '@expo/vector-icons';
 type RootStackParamList = {
   Auth: undefined;
   Main: undefined;
+  Shared: { token?: string };
 };
 
 type MainTabParamList = {
@@ -24,6 +26,29 @@ type MainTabParamList = {
 
 const Stack = createStackNavigator<RootStackParamList>();
 const Tab = createBottomTabNavigator<MainTabParamList>();
+
+const linking: LinkingOptions<RootStackParamList> = {
+  prefixes: [],
+  config: {
+    // Auth/Main are mutually exclusive based on login state and are never
+    // both in the tree at once, so neither needs (or should have) an
+    // explicit '' mapping here -- that created an ambiguous root path that
+    // resolved to whichever screen happened to be declared first (Shared),
+    // even when logged in. Only the one path that needs to be unambiguous
+    // is mapped explicitly; everything else falls back to default
+    // initial-route resolution from whichever screen is actually mounted.
+    screens: {
+      Shared: 'shared/:token',
+      Main: {
+        screens: {
+          Chat: 'chat',
+          Gigs: 'gigs',
+          Settings: 'settings',
+        },
+      },
+    },
+  },
+};
 
 const MainTabs = () => {
   const { colors } = useTheme();
@@ -106,7 +131,7 @@ export const Navigation = () => {
   }
 
   return (
-    <NavigationContainer>
+    <NavigationContainer linking={linking}>
       <Stack.Navigator
         screenOptions={{
           headerShown: false,
@@ -135,6 +160,13 @@ export const Navigation = () => {
             }}
           />
         )}
+        {/* Reachable regardless of auth state -- a cold-load of /shared/:token
+            must resolve here even when user is null, otherwise the linking
+            config has nowhere to route an unauthenticated deep link.
+            Declared after Main/Auth (not first) so root '/' with no
+            explicit path match falls back to whichever of those is
+            actually mounted, not to this screen by default-first-child. */}
+        <Stack.Screen name="Shared" component={SharedConversationScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );

@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, Image, TouchableOpacity, StyleSheet } from 'react-native';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { PersonaSwitcher } from './PersonaSwitcher';
 import type { PersonalityType } from '../../types/chat';
@@ -12,6 +13,7 @@ type ChatHeaderProps = {
   selectedPersonality: PersonalityType;
   onSelectPersonality: (personality: PersonalityType) => void;
   isDefaultPersonality: boolean;
+  onShare?: () => void;
 };
 
 export const ChatHeader: React.FC<ChatHeaderProps> = ({
@@ -20,6 +22,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
   selectedPersonality,
   onSelectPersonality,
   isDefaultPersonality,
+  onShare,
 }) => {
   const { colors, typography } = useTheme();
 
@@ -41,6 +44,12 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
           {isDefaultPersonality ? 'Desi dimaag, Giga level swag' : selectedPersonality.description}
         </Text>
       </View>
+
+      {onShare && (
+        <TouchableOpacity onPress={onShare} style={styles.shareButton} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+          <MaterialCommunityIcons name="share-variant-outline" size={19} color={colors.sub} />
+        </TouchableOpacity>
+      )}
 
       <PersonaSwitcher personalities={personalities} selectedId={selectedPersonality.id} onSelect={onSelectPersonality} />
     </View>
@@ -76,6 +85,10 @@ const styles = StyleSheet.create({
   },
   textBlock: {
     flex: 1,
+    marginRight: 8,
+  },
+  shareButton: {
+    padding: 4,
     marginRight: 8,
   },
   appName: {

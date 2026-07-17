@@ -1,9 +1,10 @@
 import os
 import json
 import logging
+import secrets
 import uuid
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from firebase_admin import firestore, auth
 import firebase_admin
 from firebase_admin import credentials
@@ -44,15 +45,15 @@ async def get_compressed_memory(chat_id: str, user_id: str, profile_id: str):
         return []
 
 async def store_message(
-    user_id: str, 
-    profile_id: str = None, 
-    personality: str = "swag", 
-    message: str = None, 
-    response: str = None, 
+    user_id: str,
+    profile_id: str = None,
+    personality: str = "swag",
+    message: str = None,
+    response: str = None,
     chat_id: str = None
-) -> str:
+) -> Tuple[str, str]:
     """Store a message in Firestore
-    
+
     Args:
         user_id: The user ID from Firebase Auth
         profile_id: The profile ID for data isolation
@@ -60,9 +61,9 @@ async def store_message(
         message: The user message
         response: The AI response
         chat_id: The chat ID (optional, will create new if not provided)
-        
+
     Returns:
-        The chat ID
+        Tuple of (chat_id, message_doc_id)
     """
     try:
         logger.info(f"Storing message for user_id: {user_id}, profile_id: {profile_id}")
@@ -109,9 +110,9 @@ async def store_message(
             'timestamp': firestore.SERVER_TIMESTAMP
         }
         message_ref.set(message_data)
-        
-        return chat_id
-        
+
+        return chat_id, message_ref.id
+
     except Exception as e:
         logger.error(f"Error storing message in Firestore: {str(e)}")
         raise
@@ -199,33 +200,118 @@ async def get_chat_messages(chat_id: str, user_id: str, profile_id: str = None, 
         logger.error(f"Error getting chat messages from Firestore: {str(e)}")
         raise
 
-async def update_chat_title(chat_id: str, user_id: str, title: str, profile_id: str = None) -> bool:
-    """Update the title of a chat
-    
+async def update_chat_title(
+    chat_id: str, user_id: str, title: str = None, profile_id: str = None, personality: str = None
+) -> bool:
+    """Update a chat's title and/or personality
+
     Args:
         chat_id: The chat ID
         user_id: The user ID from Firebase Auth
-        title: The new title
+        title: The new title (optional)
         profile_id: The profile ID for data isolation
-        
+        personality: The new default personality for this chat (optional)
+
     Returns:
         bool: True if successful
     """
     try:
         effective_user_id = profile_id or user_id
+        update_data = {'updated_at': firestore.SERVER_TIMESTAMP}
+        if title is not None:
+            update_data['title'] = title
+        if personality is not None:
+            update_data['personality'] = personality
         (
             db.collection('users')
             .document(effective_user_id)
             .collection('chats')
             .document(chat_id)
-            .update({
-                'title': title,
-                'updated_at': firestore.SERVER_TIMESTAMP
-            })
+            .update(update_data)
         )
         return True
     except Exception as e:
         logger.error(f"Error updating chat title in Firestore: {str(e)}")
+        return False
+
+
+async def update_message_response(
+    chat_id: str, message_doc_id: str, user_id: str, profile_id: str, new_response: str
+) -> bool:
+    """Overwrite an existing turn's 'response' field in place (regenerate),
+    instead of store_message's always-new-doc behavior."""
+    try:
+        effective_user_id = profile_id or user_id
+        msg_ref = (
+            db.collection('users').document(effective_user_id)
+            .collection('chats').document(chat_id)
+            .collection('messages').document(message_doc_id)
+        )
+        doc = msg_ref.get()
+        if not doc.exists:
+            return False
+        msg_ref.update({'response': new_response, 'timestamp': firestore.SERVER_TIMESTAMP})
+        return True
+    except Exception as e:
+        logger.error(f"Error updating message response: {str(e)}")
+        return False
+
+
+async def set_message_reaction(
+    chat_id: str, message_doc_id: str, user_id: str, profile_id: str, thumbs_up: bool, thumbs_down: bool
+) -> bool:
+    """Set (or clear, by passing both False) a thumbs up/down reaction on a message."""
+    try:
+        effective_user_id = profile_id or user_id
+        msg_ref = (
+            db.collection('users').document(effective_user_id)
+            .collection('chats').document(chat_id)
+            .collection('messages').document(message_doc_id)
+        )
+        doc = msg_ref.get()
+        if not doc.exists:
+            return False
+        msg_ref.update({'reactions': {'thumbsUp': thumbs_up, 'thumbsDown': thumbs_down}})
+        return True
+    except Exception as e:
+        logger.error(f"Error setting message reaction: {str(e)}")
+        return False
+
+
+async def create_share_token(chat_id: str, owner_uid: str, profile_id: str) -> str:
+    """Mint a public, read-only share token referencing a conversation.
+    Stores a reference (owner_uid/profile_id/chat_id), not a denormalized
+    copy: simpler, always reflects current state. If the owner later
+    deletes the underlying chat, the share link starts 404ing (treated as
+    equivalent to revoked) rather than serving stale content."""
+    token = secrets.token_urlsafe(16)
+    db.collection('shared_conversations').document(token).set({
+        'owner_uid': owner_uid,
+        'profile_id': profile_id,
+        'chat_id': chat_id,
+        'created_at': firestore.SERVER_TIMESTAMP,
+        'revoked': False,
+    })
+    return token
+
+
+async def get_share(token: str) -> Optional[Dict[str, Any]]:
+    """Look up a share token's reference doc, or None if it doesn't exist."""
+    doc = db.collection('shared_conversations').document(token).get()
+    return doc.to_dict() if doc.exists else None
+
+
+async def revoke_share(token: str, owner_uid: str) -> bool:
+    """Revoke a share token. Only the owner who minted it may revoke it."""
+    try:
+        ref = db.collection('shared_conversations').document(token)
+        doc = ref.get()
+        if not doc.exists or doc.to_dict().get('owner_uid') != owner_uid:
+            return False
+        ref.update({'revoked': True})
+        return True
+    except Exception as e:
+        logger.error(f"Error revoking share: {str(e)}")
         return False
 
 async def delete_chat(chat_id: str, user_id: str, profile_id: str = None) -> bool:

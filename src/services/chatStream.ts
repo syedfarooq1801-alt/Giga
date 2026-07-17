@@ -1,7 +1,7 @@
 import { getAuth } from 'firebase/auth';
 import { API_URL } from '../constants';
 
-type StreamResult = { fullText: string; conversationId: string } | null;
+type StreamResult = { fullText: string; conversationId: string; messageId: string | null } | null;
 
 /**
  * Web-only streaming counterpart to sendMessageToBackendAndGetResponse.
@@ -47,6 +47,7 @@ export async function sendMessageToBackendStream(
   let buffered = '';
   let fullText = '';
   let finalConversationId = conversationId;
+  let finalMessageId: string | null = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -60,7 +61,7 @@ export async function sendMessageToBackendStream(
     for (const event of events) {
       const line = event.trim();
       if (!line.startsWith('data: ')) continue;
-      let payload: { text?: string; done?: boolean; conversation_id?: string };
+      let payload: { text?: string; done?: boolean; conversation_id?: string; message_id?: string };
       try {
         payload = JSON.parse(line.slice('data: '.length));
       } catch {
@@ -72,9 +73,10 @@ export async function sendMessageToBackendStream(
       }
       if (payload.done) {
         finalConversationId = payload.conversation_id || finalConversationId;
+        finalMessageId = payload.message_id || null;
       }
     }
   }
 
-  return { fullText: fullText.trim(), conversationId: finalConversationId };
+  return { fullText: fullText.trim(), conversationId: finalConversationId, messageId: finalMessageId };
 }
