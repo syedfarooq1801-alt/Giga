@@ -11,7 +11,8 @@
     "build": "expo export -p web",
     "generate-favicon": "node scripts/create-large-favicon.js",
     "prestart": "npm run generate-favicon",
-    "prebuild": "npm run generate-favicon"
+    "prebuild": "npm run generate-favicon",
+    "postinstall": "patch-package"
   },
   "dependencies": {
     "@expo/metro-runtime": "~3.1.3",
