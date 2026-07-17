@@ -16,8 +16,7 @@ import {
   KeyboardAvoidingView,
   Modal,
   Pressable,
-  Image,
-  Alert
+  Image
 } from 'react-native';
 
 
@@ -32,6 +31,7 @@ import { TypingBubble } from '../components/TypingBubble';
 import { ChatHeader } from '../components/chat/ChatHeader';
 import { getPersonaAccent } from '../theme/tokens';
 import { sendMessageToBackendStream } from '../services/chatStream';
+import Toast from 'react-native-toast-message';
 import { getAuth } from 'firebase/auth';
 import { getConversationTitleFromMistral } from '../utils/mistralTitle';
 import { PersonalityType } from '../types/chat';
@@ -423,7 +423,7 @@ const ChatScreen = () => {
           console.error('Error streaming message:', streamError);
           setIsTyping(false);
           setMessages(prev => prev.filter(msg => msg.id !== streamId));
-          Alert.alert('Error', 'Failed to send message. Please check your connection and try again.');
+          Toast.show({ type: 'error', text1: 'Failed to send message', text2: 'Check your connection and try again.', position: 'bottom' });
         }
 
         return;
@@ -497,10 +497,7 @@ const ChatScreen = () => {
       setIsTyping(false);
 
       // Show error to user
-      Alert.alert(
-        'Error',
-        'Failed to send message. Please check your connection and try again.'
-      );
+      Toast.show({ type: 'error', text1: 'Failed to send message', text2: 'Check your connection and try again.', position: 'bottom' });
     }
   };
 
@@ -542,7 +539,7 @@ const ChatScreen = () => {
       }
     } catch (error) {
       console.error('Error regenerating message:', error);
-      Alert.alert('Error', 'Failed to regenerate response. Please try again.');
+      Toast.show({ type: 'error', text1: 'Failed to regenerate response', text2: 'Please try again.', position: 'bottom' });
     } finally {
       setRegeneratingId(null);
     }
@@ -562,15 +559,26 @@ const ChatScreen = () => {
         ? `${window.location.origin}${data.url}`
         : data.url;
 
+      let copied = false;
       if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
-        await navigator.clipboard.writeText(fullUrl);
-        Alert.alert('Link copied', 'Share link copied to clipboard.');
-      } else {
-        Alert.alert('Share link', fullUrl);
+        try {
+          await navigator.clipboard.writeText(fullUrl);
+          copied = true;
+        } catch (clipboardError) {
+          console.warn('Clipboard write failed, falling back to showing the link:', clipboardError);
+        }
       }
+
+      Toast.show({
+        type: 'success',
+        text1: copied ? 'Link copied' : 'Share link ready',
+        text2: copied ? 'Share link copied to clipboard.' : fullUrl,
+        position: 'bottom',
+        visibilityTime: copied ? 3000 : 6000,
+      });
     } catch (error) {
       console.error('Error sharing conversation:', error);
-      Alert.alert('Error', 'Failed to create share link. Please try again.');
+      Toast.show({ type: 'error', text1: 'Failed to create share link', text2: 'Please try again.', position: 'bottom' });
     }
   };
 
