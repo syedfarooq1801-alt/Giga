@@ -212,6 +212,7 @@ const ChatScreen = () => {
   const [useDocuments, setUseDocuments] = useState(false);
   const [isUploadingDoc, setIsUploadingDoc] = useState(false);
   const [pendingImage, setPendingImage] = useState<{ dataUrl: string } | null>(null);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [selectedPersonality, setSelectedPersonality] = useState<PersonalityType>(PERSONALITIES[DEFAULT_PERSONALITY_ID]);
   const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
   const [isOnline, setIsOnline] = useState(true);
@@ -398,6 +399,7 @@ const ChatScreen = () => {
   // successful upload, since uploading something is a clear signal the
   // user wants the next reply to use it.
   const handleAttachDocument = async () => {
+    setShowAttachMenu(false);
     setIsUploadingDoc(true);
     const result = await pickAndUploadDocument();
     setIsUploadingDoc(false);
@@ -409,6 +411,7 @@ const ChatScreen = () => {
   // get_groq_vision_response), not a persistent per-conversation toggle
   // like RAG, so there's no equivalent "enable" flag to flip here.
   const handleAttachImage = async () => {
+    setShowAttachMenu(false);
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       base64: true,
@@ -1385,6 +1388,38 @@ const ChatScreen = () => {
       justifyContent: 'center',
       marginLeft: 4,
     },
+    attachMenuBackdrop: {
+      position: Platform.OS === 'web' ? ('fixed' as any) : 'absolute',
+      top: -1000,
+      left: -1000,
+      right: -1000,
+      bottom: -1000,
+    },
+    attachMenu: {
+      position: 'absolute',
+      bottom: 42,
+      left: 4,
+      borderRadius: 12,
+      borderWidth: 1,
+      paddingVertical: 4,
+      minWidth: 140,
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: 0.12,
+      shadowRadius: 12,
+      elevation: 6,
+      zIndex: 20,
+    },
+    attachMenuItem: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      paddingVertical: 10,
+      paddingHorizontal: 14,
+    },
+    attachMenuLabel: {
+      fontSize: 14,
+    },
     pendingImageRow: {
       paddingHorizontal: 12,
       paddingBottom: 8,
@@ -1722,25 +1757,39 @@ const ChatScreen = () => {
         </View>
       )}
       <View style={styles.inputContainer}>
-        <TouchableOpacity
-          onPress={handleAttachImage}
-          style={styles.docsToggle}
-          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-        >
-          <MaterialCommunityIcons name="image-outline" size={18} color={colors.sub} />
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={handleAttachDocument}
-          disabled={isUploadingDoc}
-          style={styles.docsToggle}
-          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-        >
-          {isUploadingDoc ? (
-            <ActivityIndicator size="small" color={colors.sub} />
-          ) : (
-            <MaterialCommunityIcons name="paperclip" size={18} color={colors.sub} />
+        <View>
+          {showAttachMenu && (
+            <>
+              <TouchableOpacity
+                style={styles.attachMenuBackdrop}
+                activeOpacity={1}
+                onPress={() => setShowAttachMenu(false)}
+              />
+              <View style={[styles.attachMenu, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                <TouchableOpacity style={styles.attachMenuItem} onPress={handleAttachImage}>
+                  <MaterialCommunityIcons name="image-outline" size={18} color={colors.ink} />
+                  <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Photo</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.attachMenuItem} onPress={handleAttachDocument}>
+                  <MaterialCommunityIcons name="file-document-outline" size={18} color={colors.ink} />
+                  <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Document</Text>
+                </TouchableOpacity>
+              </View>
+            </>
           )}
-        </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => setShowAttachMenu(prev => !prev)}
+            disabled={isUploadingDoc}
+            style={styles.docsToggle}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            {isUploadingDoc ? (
+              <ActivityIndicator size="small" color={colors.sub} />
+            ) : (
+              <MaterialCommunityIcons name="paperclip" size={18} color={colors.sub} />
+            )}
+          </TouchableOpacity>
+        </View>
         <TouchableOpacity
           onPress={() => setUseDocuments(prev => !prev)}
           style={[styles.docsToggle, useDocuments && { backgroundColor: accentColor }]}
