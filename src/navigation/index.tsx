@@ -1,6 +1,6 @@
-import React from 'react';
-import { View, ActivityIndicator, StyleSheet } from 'react-native';
-import { NavigationContainer, LinkingOptions } from '@react-navigation/native';
+import React, { useRef, useEffect } from 'react';
+import { View, ActivityIndicator, StyleSheet, Animated } from 'react-native';
+import { NavigationContainer, LinkingOptions, useIsFocused } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import ChatScreen from '../screens/ChatScreen';
@@ -47,6 +47,24 @@ const linking: LinkingOptions<RootStackParamList> = {
   },
 };
 
+// react-navigation/bottom-tabs v6 has no built-in cross-fade between tabs
+// (screens just swap instantly) -- this wraps each tab's screen so
+// switching Chat <-> Settings eases in instead of snapping. useIsFocused
+// (not the mount lifecycle) drives it since both tab screens stay mounted
+// simultaneously under the default tab navigator.
+const FadeInScreen: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const isFocused = useIsFocused();
+  const opacity = useRef(new Animated.Value(isFocused ? 1 : 0)).current;
+  useEffect(() => {
+    Animated.timing(opacity, {
+      toValue: isFocused ? 1 : 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [isFocused, opacity]);
+  return <Animated.View style={{ flex: 1, opacity }}>{children}</Animated.View>;
+};
+
 const MainTabs = () => {
   const { colors } = useTheme();
 
@@ -64,22 +82,32 @@ const MainTabs = () => {
     >
       <Tab.Screen
         name="Chat"
-        component={ChatScreen}
         options={{
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="chatbubble-outline" size={size} color={color} />
           ),
         }}
-      />
+      >
+        {(props) => (
+          <FadeInScreen>
+            <ChatScreen {...props} />
+          </FadeInScreen>
+        )}
+      </Tab.Screen>
       <Tab.Screen
         name="Settings"
-        component={SettingsScreen}
         options={{
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="settings-outline" size={size} color={color} />
           ),
         }}
-      />
+      >
+        {(props) => (
+          <FadeInScreen>
+            <SettingsScreen {...props} />
+          </FadeInScreen>
+        )}
+      </Tab.Screen>
     </Tab.Navigator>
   );
 };
