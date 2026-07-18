@@ -82,6 +82,12 @@ interface Styles extends Record<string, any> {
 
 const ASYNC_STORAGE_CURRENT_CONVERSATION_KEY_PREFIX = 'currentConversation_';
 
+const EMOJI_OPTIONS = [
+  '😀', '😂', '😍', '😎', '🤔', '😢', '😡', '🙏',
+  '👍', '👎', '🔥', '💯', '🎉', '❤️', '😭', '🙌',
+  '😅', '🥲', '😳', '🤣', '👀', '✨', '💀', '🤝',
+];
+
 const saveCurrentConversationToStorage = async (profileId: string, conversation: Conversation | null) => {
   if (!profileId) return;
   const key = `${ASYNC_STORAGE_CURRENT_CONVERSATION_KEY_PREFIX}${profileId}`;
@@ -213,6 +219,7 @@ const ChatScreen = () => {
   const [isUploadingDoc, setIsUploadingDoc] = useState(false);
   const [pendingImage, setPendingImage] = useState<{ dataUrl: string } | null>(null);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [showEmojiMenu, setShowEmojiMenu] = useState(false);
   const [selectedPersonality, setSelectedPersonality] = useState<PersonalityType>(PERSONALITIES[DEFAULT_PERSONALITY_ID]);
   const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
   const [isOnline, setIsOnline] = useState(true);
@@ -1429,6 +1436,33 @@ const ChatScreen = () => {
     attachMenuLabel: {
       fontSize: 14,
     },
+    emojiMenu: {
+      position: 'absolute',
+      bottom: 42,
+      left: 4,
+      borderRadius: 12,
+      borderWidth: 1,
+      padding: 8,
+      width: 216,
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: 0.12,
+      shadowRadius: 12,
+      elevation: 6,
+      zIndex: 20,
+    },
+    emojiMenuItem: {
+      width: 34,
+      height: 34,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: 8,
+    },
+    emojiMenuGlyph: {
+      fontSize: 18,
+    },
     pendingImageRow: {
       paddingHorizontal: 12,
       paddingBottom: 8,
@@ -1798,33 +1832,69 @@ const ChatScreen = () => {
                   <MaterialCommunityIcons name="file-document-outline" size={18} color={colors.ink} />
                   <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Document</Text>
                 </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.attachMenuItem}
+                  onPress={() => {
+                    setUseDocuments(prev => !prev);
+                    setShowAttachMenu(false);
+                  }}
+                >
+                  <MaterialCommunityIcons
+                    name={useDocuments ? 'checkbox-marked' : 'checkbox-blank-outline'}
+                    size={18}
+                    color={useDocuments ? accentColor : colors.ink}
+                  />
+                  <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Use my documents</Text>
+                </TouchableOpacity>
               </View>
             </>
           )}
           <TouchableOpacity
             onPress={() => setShowAttachMenu(prev => !prev)}
             disabled={isUploadingDoc}
-            style={styles.docsToggle}
+            style={[styles.docsToggle, useDocuments && { backgroundColor: accentColor }]}
             hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
           >
             {isUploadingDoc ? (
               <ActivityIndicator size="small" color={colors.sub} />
             ) : (
-              <MaterialCommunityIcons name="paperclip" size={18} color={colors.sub} />
+              <MaterialCommunityIcons name="paperclip" size={18} color={useDocuments ? colors.accentContrast : colors.sub} />
             )}
           </TouchableOpacity>
         </View>
-        <TouchableOpacity
-          onPress={() => setUseDocuments(prev => !prev)}
-          style={[styles.docsToggle, useDocuments && { backgroundColor: accentColor }]}
-          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-        >
-          <MaterialCommunityIcons
-            name="file-document-outline"
-            size={18}
-            color={useDocuments ? colors.accentContrast : colors.sub}
-          />
-        </TouchableOpacity>
+        <View>
+          {showEmojiMenu && (
+            <>
+              <TouchableOpacity
+                style={styles.attachMenuBackdrop}
+                activeOpacity={1}
+                onPress={() => setShowEmojiMenu(false)}
+              />
+              <View style={[styles.emojiMenu, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                {EMOJI_OPTIONS.map(emoji => (
+                  <TouchableOpacity
+                    key={emoji}
+                    style={styles.emojiMenuItem}
+                    onPress={() => {
+                      setInputText(prev => prev + emoji);
+                      setShowEmojiMenu(false);
+                      inputRef.current?.focus();
+                    }}
+                  >
+                    <Text style={styles.emojiMenuGlyph}>{emoji}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>
+          )}
+          <TouchableOpacity
+            onPress={() => setShowEmojiMenu(prev => !prev)}
+            style={styles.docsToggle}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            <MaterialCommunityIcons name="emoticon-outline" size={18} color={colors.sub} />
+          </TouchableOpacity>
+        </View>
         <TextInput
           ref={inputRef}
           style={styles.input}
