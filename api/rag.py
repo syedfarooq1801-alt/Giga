@@ -21,7 +21,6 @@ import io
 import logging
 import os
 import re
-import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -57,37 +56,29 @@ def _import_qdrant():
     return _QdrantClient
 
 
-def _embed_texts(texts: List[str]) -> List[List[float]]:
+async def _embed_texts(texts: List[str]) -> List[List[float]]:
+    # Deliberately async and called directly from the event loop, NOT
+    # via asyncio.to_thread -- Vercel's sandboxed runtime hard-fails a
+    # SECOND outbound connection opened from the same worker thread that
+    # already opened one for Qdrant (_get_client() in the callers below),
+    # raising "[Errno 16] Device or resource busy" out of getaddrinfo on
+    # every attempt, not intermittently. Retrying in that same thread
+    # doesn't help since it's not transient. Running this on the main
+    # thread instead of a worker thread sidesteps the conflict entirely.
     if not HF_API_TOKEN:
         raise RuntimeError("Document embeddings aren't configured (HF_API_TOKEN missing).")
     # wait_for_model=True makes HF block server-side until a cold model is
     # ready instead of returning a 503 -- simpler than a manual retry loop,
     # at the cost of a longer timeout on a cold start.
-    #
-    # Retried on transport errors: Vercel's sandboxed runtime has been
-    # observed to throw "[Errno 16] Device or resource busy" out of
-    # getaddrinfo for a *second* outbound connection opened in the same
-    # worker thread right after the Qdrant client's own connection (this
-    # function runs after _get_client() in the upload/search paths) --
-    # a transient resource-contention quirk of the sandbox, not a real
-    # DNS/network failure, and it reliably succeeds on retry.
-    last_error: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            resp = httpx.post(
-                HF_EMBEDDING_URL,
-                headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
-                json={"inputs": texts, "options": {"wait_for_model": True}},
-                timeout=45,
-            )
-            if resp.status_code != 200:
-                raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
-            return resp.json()
-        except httpx.TransportError as e:
-            last_error = e
-            logger.warning(f"Embedding request transport error (attempt {attempt + 1}/3): {e}")
-            time.sleep(0.5 * (attempt + 1))
-    raise RuntimeError(f"Embedding request failed after retries: {last_error}")
+    async with httpx.AsyncClient(timeout=45) as client:
+        resp = await client.post(
+            HF_EMBEDDING_URL,
+            headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+            json={"inputs": texts, "options": {"wait_for_model": True}},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
+    return resp.json()
 
 
 def _ensure_collection(client: Any) -> None:
@@ -169,17 +160,10 @@ def extract_text(filename: str, content: bytes) -> str:
 # asyncio.to_thread(), which is the standard fix for wrapping sync-only
 # libraries in an async app.
 
-def _sync_upload_document(profile_id: str, filename: str, content: bytes) -> Dict[str, Any]:
+def _sync_upsert_chunks(profile_id: str, filename: str, chunks: List[str], embeddings: List[List[float]]) -> Dict[str, Any]:
     client = _get_client()
     if client is None:
         raise RuntimeError("Document storage (Qdrant) is not configured or unreachable right now.")
-
-    text = extract_text(filename, content)
-    chunks = chunk_text(text)
-    if not chunks:
-        raise ValueError("No extractable text found in this document.")
-
-    embeddings = _embed_texts(chunks)
 
     doc_id = str(uuid.uuid4())
     points = [
@@ -205,7 +189,15 @@ async def upload_document(profile_id: str, filename: str, content: bytes) -> Dic
     {doc_id, chunk_count} for the caller to mirror into Firestore metadata.
     Raises RuntimeError/ValueError on failure -- an upload the user
     explicitly requested should surface a real error, not silently no-op."""
-    return await asyncio.to_thread(_sync_upload_document, profile_id, filename, content)
+    text = await asyncio.to_thread(extract_text, filename, content)
+    chunks = chunk_text(text)
+    if not chunks:
+        raise ValueError("No extractable text found in this document.")
+
+    # Embeddings run on the main thread (see _embed_texts) -- only the
+    # Qdrant upsert itself (sync-only client) goes through a worker thread.
+    embeddings = await _embed_texts(chunks)
+    return await asyncio.to_thread(_sync_upsert_chunks, profile_id, filename, chunks, embeddings)
 
 
 def _sync_delete_document_vectors(profile_id: str, doc_id: str) -> None:
@@ -229,12 +221,11 @@ async def delete_document_vectors(profile_id: str, doc_id: str) -> None:
     await asyncio.to_thread(_sync_delete_document_vectors, profile_id, doc_id)
 
 
-def _sync_search_context(profile_id: str, query_text: str, top_k: int) -> List[str]:
+def _sync_query_vector(profile_id: str, query_vector: List[float], top_k: int) -> List[str]:
     client = _get_client()
     if client is None:
         return []
     try:
-        query_vector = _embed_texts([query_text])[0]
         # qdrant-client >=1.10 deprecated .search() in favor of
         # .query_points() -- same idea (vector + filter -> ranked hits),
         # response is a QueryResponse wrapping .points instead of a bare list.
@@ -256,4 +247,9 @@ async def search_context(profile_id: str, query: str, top_k: int = TOP_K) -> Lis
     """Top-k relevant chunk texts for this user's query. ALWAYS returns a
     list (empty on any failure) -- never raises. Callers in the live chat
     path treat an empty list as "skip augmentation", not an error."""
-    return await asyncio.to_thread(_sync_search_context, profile_id, query, top_k)
+    try:
+        query_vector = (await _embed_texts([query]))[0]
+    except Exception as e:
+        logger.warning(f"RAG embedding failed, degrading gracefully (no context injected): {e}")
+        return []
+    return await asyncio.to_thread(_sync_query_vector, profile_id, query_vector, top_k)
