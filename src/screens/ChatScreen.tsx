@@ -983,34 +983,42 @@ const ChatScreen = () => {
       }
     };
     
+    // Guards against speakWithVoice firing twice for the same utterance --
+    // onvoiceschanged can still fire even after getVoices() already
+    // returned a populated list on some browsers, so without this a
+    // reply already spoken via the immediate-call branch gets spoken
+    // again when that event lands.
+    let hasSpoken = false;
+    const speakOnce = () => {
+      if (hasSpoken) return;
+      hasSpoken = true;
+      window.speechSynthesis.onvoiceschanged = null;
+      speakWithVoice();
+    };
+
     // For iOS Chrome, we need to handle voice loading differently
     if (isIOSChrome) {
       // On iOS Chrome, we need to wait for a user gesture to load voices
       const loadVoices = () => {
         const voices = window.speechSynthesis.getVoices();
         if (voices.length > 0) {
-          speakWithVoice();
+          speakOnce();
         } else {
           // If voices aren't loaded yet, try again after a short delay
           setTimeout(loadVoices, 100);
         }
       };
-      
+
       // Start loading voices
       loadVoices();
+    } else if (window.speechSynthesis.getVoices().length > 0) {
+      // Voices already loaded -- speak immediately, don't also arm
+      // onvoiceschanged (that's what caused the double-speak).
+      speakOnce();
     } else {
-      // For other browsers, use the standard approach
-      if (window.speechSynthesis.onvoiceschanged !== undefined) {
-        window.speechSynthesis.onvoiceschanged = speakWithVoice;
-      }
-      
-      // Try to speak immediately if voices are already loaded
-      if (window.speechSynthesis.getVoices().length > 0) {
-        speakWithVoice();
-      } else {
-        // If voices aren't loaded yet, wait a moment and try again
-        setTimeout(speakWithVoice, 1000);
-      }
+      window.speechSynthesis.onvoiceschanged = speakOnce;
+      // Safety net in case the event never fires on this browser.
+      setTimeout(speakOnce, 1000);
     }
   }, [isIOS, isIOSChrome]);
 
@@ -1077,17 +1085,24 @@ const ChatScreen = () => {
           window.speechSynthesis.speak(utterance);
         };
         
-        // Load voices if not already loaded
-        if (window.speechSynthesis.onvoiceschanged !== undefined) {
-          window.speechSynthesis.onvoiceschanged = speakWithVoice;
-        }
-        
-        // Try to speak immediately if voices are already loaded
-        if (window.speechSynthesis.getVoices().length > 0) {
+        // Guards against speakWithVoice firing twice for the same
+        // utterance -- see the identical fix + comment in fallbackTts above.
+        let hasSpoken = false;
+        const speakOnce = () => {
+          if (hasSpoken) return;
+          hasSpoken = true;
+          window.speechSynthesis.onvoiceschanged = null;
           speakWithVoice();
+        };
+
+        // Try to speak immediately if voices are already loaded; only
+        // arm onvoiceschanged as a fallback when they aren't, never both.
+        if (window.speechSynthesis.getVoices().length > 0) {
+          speakOnce();
         } else {
-          // If voices aren't loaded yet, wait a moment and try again
-          setTimeout(speakWithVoice, 1000);
+          window.speechSynthesis.onvoiceschanged = speakOnce;
+          // Safety net in case the event never fires on this browser.
+          setTimeout(speakOnce, 1000);
         }
       });
     }
