@@ -208,6 +208,7 @@ const ChatScreen = () => {
   const [isTyping, setIsTyping] = useState(false);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [isTtsPlaying, setIsTtsPlaying] = useState(false);
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
   const [inputText, setInputText] = useState('');
@@ -1264,21 +1265,21 @@ const ChatScreen = () => {
     const isActive = isRecognitionActive();
 
     if (isActive) {
-      // Stop recording and process the speech
+      // Stop recording and process the speech. inputText is deliberately
+      // left untouched here (see the start branch below for why) -- the
+      // transcript goes straight to sendMessageToBackendAndGetResponse,
+      // never through inputText/handleSendMessage.
+      setIsListening(false);
+      setIsTranscribing(true);
       setIsTyping(true);
-      setInputText('Transcribing...');
 
       try {
         const transcript = await stopSpeechRecognition();
 
         if (!transcript || !transcript.trim()) {
-          setInputText('');
           return;
         }
 
-        // Clear input field immediately
-        setInputText('');
-        
         // Create user message immediately for instant feedback
         const userMessage: ChatMessage = {
           id: `temp-${Date.now()}`,
@@ -1358,29 +1359,28 @@ const ChatScreen = () => {
         }
       } catch (error) {
         console.error('Error in speech recognition or message processing:', error);
-        setInputText('');
         alert('Failed to process speech. Please try again.');
       } finally {
         setIsTyping(false);
+        setIsTranscribing(false);
       }
     } else {
-      // Start recording
+      // Start recording -- inputText is left alone (not hijacked with a
+      // placeholder string) so whatever the user already typed survives;
+      // the mic UI communicates "listening" via isListening (button
+      // state + input placeholder), not by overwriting real input text.
       try {
         // Request microphone permission first
         await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        // Clear any previous input
-        setInputText('Listening...');
-
-        // Start speech recognition
         const started = await startSpeechRecognition();
-        if (!started) {
-          setInputText('');
+        if (started) {
+          setIsListening(true);
+        } else {
           alert('Could not start speech recognition. Please try again.');
         }
       } catch (error) {
         console.error('Error accessing microphone:', error);
-        setInputText('');
         alert('Microphone access is required for speech recognition. Please allow microphone access and try again.');
       }
     }
@@ -1927,14 +1927,26 @@ const ChatScreen = () => {
           style={styles.input}
           value={inputText}
           onChangeText={setInputText}
-          placeholder={`Message ${selectedPersonality.name}...`}
+          placeholder={
+            isListening ? 'Listening...' : isTranscribing ? 'Transcribing...' : `Message ${selectedPersonality.name}...`
+          }
           placeholderTextColor={colors.textTertiary}
           multiline
           maxLength={1000}
-          editable={!isLoadingMessages}
+          editable={!isLoadingMessages && !isListening}
           blurOnSubmit={false}
           returnKeyType="send"
           onSubmitEditing={() => {
+            // While recording, Enter should behave like pressing the mic
+            // button again (stop, transcribe, send) rather than sending
+            // whatever's in inputText -- previously inputText itself got
+            // overwritten with the literal string "Listening...", so
+            // pressing send/Enter while recording sent that text as the
+            // message instead of what was actually said.
+            if (isListening) {
+              void handleMicPress();
+              return;
+            }
             // handleSendMessage lazily creates a conversation
             // (currentConversation ?? createNewConversation()) if none is
             // selected yet -- gating this on currentConversation already
@@ -1969,13 +1981,22 @@ const ChatScreen = () => {
           )}
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.sendButton, (!inputText.trim() || isTyping || isLoadingMessages) && styles.sendButtonDisabled]}
+          style={[
+            styles.sendButton,
+            ((!isListening && !inputText.trim()) || isTyping || isLoadingMessages) && styles.sendButtonDisabled,
+          ]}
           onPress={() => {
+            // Same "send should finish listening, not send garbage" fix
+            // as onSubmitEditing above.
+            if (isListening) {
+              void handleMicPress();
+              return;
+            }
             if (inputText.trim()) {
               void handleSendMessage(inputText);
             }
           }}
-          disabled={!inputText.trim() || isTyping || isLoadingMessages}
+          disabled={(!isListening && !inputText.trim()) || isTyping || isLoadingMessages}
         >
           <MaterialCommunityIcons name="send" size={20} color={colors.accentContrast} />
         </TouchableOpacity>
