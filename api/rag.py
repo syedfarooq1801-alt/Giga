@@ -21,6 +21,7 @@ import io
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -62,15 +63,31 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
     # wait_for_model=True makes HF block server-side until a cold model is
     # ready instead of returning a 503 -- simpler than a manual retry loop,
     # at the cost of a longer timeout on a cold start.
-    resp = httpx.post(
-        HF_EMBEDDING_URL,
-        headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
-        json={"inputs": texts, "options": {"wait_for_model": True}},
-        timeout=45,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
-    return resp.json()
+    #
+    # Retried on transport errors: Vercel's sandboxed runtime has been
+    # observed to throw "[Errno 16] Device or resource busy" out of
+    # getaddrinfo for a *second* outbound connection opened in the same
+    # worker thread right after the Qdrant client's own connection (this
+    # function runs after _get_client() in the upload/search paths) --
+    # a transient resource-contention quirk of the sandbox, not a real
+    # DNS/network failure, and it reliably succeeds on retry.
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            resp = httpx.post(
+                HF_EMBEDDING_URL,
+                headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+                json={"inputs": texts, "options": {"wait_for_model": True}},
+                timeout=45,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
+            return resp.json()
+        except httpx.TransportError as e:
+            last_error = e
+            logger.warning(f"Embedding request transport error (attempt {attempt + 1}/3): {e}")
+            time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(f"Embedding request failed after retries: {last_error}")
 
 
 def _ensure_collection(client: Any) -> None:
