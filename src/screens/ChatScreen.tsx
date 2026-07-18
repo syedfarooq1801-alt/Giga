@@ -691,7 +691,10 @@ const ChatScreen = () => {
     return assistantMessages.length > 0 ? assistantMessages[assistantMessages.length - 1].id : null;
   }, [messages]);
 
-  const handleReact = async (msg: ChatMessage, thumbsUp: boolean, thumbsDown: boolean) => {
+  // useCallback with a stable identity (not recreated on every keystroke)
+  // is what lets renderItem below stay memoized -- an unstable handler
+  // here would defeat that no matter how renderItem itself is wrapped.
+  const handleReact = useCallback(async (msg: ChatMessage, thumbsUp: boolean, thumbsDown: boolean) => {
     if (!currentConversation?.id || !msg.messageDocId) return;
     setMessages(prev => prev.map(m => (m.id === msg.id ? { ...m, reactions: { thumbsUp, thumbsDown } } : m)));
     try {
@@ -704,9 +707,9 @@ const ChatScreen = () => {
     } catch (error) {
       console.error('Error reacting to message:', error);
     }
-  };
+  }, [currentConversation?.id]);
 
-  const handleRegenerate = async (msg: ChatMessage) => {
+  const handleRegenerate = useCallback(async (msg: ChatMessage) => {
     if (!currentConversation?.id || !msg.messageDocId) return;
     setRegeneratingId(msg.id);
     try {
@@ -727,7 +730,35 @@ const ChatScreen = () => {
     } finally {
       setRegeneratingId(null);
     }
-  };
+  }, [currentConversation?.id]);
+
+  // Stable renderItem is what actually stops the message list re-rendering
+  // on every keystroke -- FlatList skips re-invoking renderItem for rows
+  // whose data hasn't changed as long as the function reference itself is
+  // stable, so typing (which only changes inputText, not messages) no
+  // longer touches these rows at all. Depends only on things that
+  // genuinely affect a bubble's rendered output, all of them cheap
+  // primitives or already-stabilized callbacks.
+  const renderMessageItem = useCallback(({ item }: { item: ChatMessage }) => {
+    if (item.id === 'typing-indicator') {
+      return <TypingBubble />;
+    }
+    return (
+      <MessageBubble
+        key={`${item.id}-${item.timestamp}`}
+        text={item.text}
+        sender={item.sender}
+        personalityEmoji={item.sender === 'assistant' && PERSONALITIES[item.personalityId || 'default']?.emoji ? PERSONALITIES[item.personalityId || 'default'].emoji : undefined}
+        accentColor={accentColor}
+        reactions={item.reactions}
+        onReact={item.sender === 'assistant' && item.messageDocId ? (up, down) => handleReact(item, up, down) : undefined}
+        isLastAssistantMessage={item.sender === 'assistant' && item.id === lastAssistantId}
+        onRegenerate={item.messageDocId ? () => handleRegenerate(item) : undefined}
+        isRegenerating={regeneratingId === item.id}
+        imageUri={item.imageUri}
+      />
+    );
+  }, [accentColor, lastAssistantId, regeneratingId, handleReact, handleRegenerate]);
 
   const handleShare = async () => {
     if (!currentConversation?.id) return;
@@ -1762,26 +1793,7 @@ const ChatScreen = () => {
               Date.now();
           return `msg-${item.id}-${item.sender}-${timestamp}`;
         }}
-        renderItem={({ item }: { item: ChatMessage }) => {
-          if (item.id === 'typing-indicator') {
-            return <TypingBubble />;
-          }
-          return (
-            <MessageBubble
-              key={`${item.id}-${item.timestamp}`}
-              text={item.text}
-              sender={item.sender}
-              personalityEmoji={item.sender === 'assistant' && PERSONALITIES[item.personalityId || 'default']?.emoji ? PERSONALITIES[item.personalityId || 'default'].emoji : undefined}
-              accentColor={accentColor}
-              reactions={item.reactions}
-              onReact={item.sender === 'assistant' && item.messageDocId ? (up, down) => handleReact(item, up, down) : undefined}
-              isLastAssistantMessage={item.sender === 'assistant' && item.id === lastAssistantId}
-              onRegenerate={item.messageDocId ? () => handleRegenerate(item) : undefined}
-              isRegenerating={regeneratingId === item.id}
-              imageUri={item.imageUri}
-            />
-          );
-        }}
+        renderItem={renderMessageItem}
         style={[styles.messageList, { flex: 1 }]}
         contentContainerStyle={{ 
           flexGrow: 1, 

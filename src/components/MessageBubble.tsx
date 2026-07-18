@@ -1,5 +1,5 @@
-import React from 'react';
-import { View, Text, Image, StyleSheet, TouchableOpacity, ActivityIndicator, Platform } from 'react-native';
+import React, { useMemo, useRef, useEffect } from 'react';
+import { View, Text, Image, StyleSheet, TouchableOpacity, ActivityIndicator, Platform, Animated } from 'react-native';
 import Markdown from 'react-native-markdown-display';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
@@ -23,7 +23,10 @@ type MessageBubbleProps = {
   imageUri?: string;
 };
 
-export const MessageBubble: React.FC<MessageBubbleProps> = ({
+// Memoized so a parent re-render (e.g. the input box changing on every
+// keystroke) doesn't force every visible bubble to redo Markdown parsing --
+// only bubbles whose own props actually changed re-render.
+export const MessageBubble: React.FC<MessageBubbleProps> = React.memo(({
   text,
   sender,
   personalityEmoji,
@@ -38,6 +41,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   const { colors, isDark, radius, typography } = useTheme();
   const isUser = sender === 'user';
 
+  // Fades in once on mount only -- MessageBubble is memoized, so an
+  // existing message re-rendering (e.g. a reaction toggling) doesn't
+  // remount it and doesn't replay this, only a genuinely new bubble does.
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(fadeAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+  }, [fadeAnim]);
+
   // User messages keep a bubble (right-aligned, uniform rounded corners --
   // the one visually "contained" element in the thread). Assistant replies
   // are flat: no background box, full-width text with a small avatar badge,
@@ -45,8 +56,16 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   const bubbleBg = isDark ? (accentColor || colors.accent) : colors.userMessageBackground;
   const bubbleText = colors.userMessageText;
 
+  // Stable object identity across renders (only changes when the theme
+  // actually does) -- otherwise Markdown treats every render as a fresh
+  // style prop and redoes work it doesn't need to.
+  const markdownStyles = useMemo(
+    () => getMarkdownStyles(colors, colors.ink, typography),
+    [colors, typography]
+  );
+
   const assistantContent = (
-    <Markdown style={getMarkdownStyles(colors, colors.ink, typography)}>{text || ' '}</Markdown>
+    <Markdown style={markdownStyles}>{text || ' '}</Markdown>
   );
 
   const actionsRow = !isUser && (onReact || (isLastAssistantMessage && onRegenerate)) ? (
@@ -99,7 +118,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
   if (isUser) {
     return (
-      <View style={styles.wrapper}>
+      <Animated.View style={[styles.wrapper, { opacity: fadeAnim }]}>
         <View
           style={[
             styles.container,
@@ -110,12 +129,12 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           {imageUri && <Image source={{ uri: imageUri }} style={styles.attachedImage} resizeMode="cover" />}
           {!!text && <Text style={[styles.text, { color: bubbleText }]}>{text}</Text>}
         </View>
-      </View>
+      </Animated.View>
     );
   }
 
   return (
-    <View style={styles.wrapper}>
+    <Animated.View style={[styles.wrapper, { opacity: fadeAnim }]}>
       <View style={styles.assistantRow}>
         <View style={[styles.avatar, { backgroundColor: accentColor || colors.accent }]}>
           <Text style={styles.avatarEmoji}>{personalityEmoji || '🤖'}</Text>
@@ -125,9 +144,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           {actionsRow}
         </View>
       </View>
-    </View>
+    </Animated.View>
   );
-};
+});
 
 // Code blocks styled off the token system (surface/line/mono stack), not
 // hardcoded colors, so they stay consistent with the rest of the app.
