@@ -25,8 +25,6 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
 
 logger = logging.getLogger("rag")
 
@@ -41,8 +39,21 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 TOP_K = 3
 
-_qdrant_client: Optional[QdrantClient] = None
+_qdrant_client: Optional[Any] = None
 _qdrant_unavailable = False  # sticky after first failed connect, avoids retrying every request
+qmodels = None  # populated by _import_qdrant() on first real use
+
+
+def _import_qdrant():
+    """Deferred import -- qdrant-client is only needed by requests that
+    touch documents/RAG, but this module is imported by main.py on every
+    cold start regardless. Importing it eagerly here added dead weight to
+    every single request's cold-start time, not just the ones that use it."""
+    global qmodels
+    from qdrant_client import QdrantClient as _QdrantClient
+    from qdrant_client.http import models as _qmodels
+    qmodels = _qmodels
+    return _QdrantClient
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
@@ -62,7 +73,7 @@ def _embed_texts(texts: List[str]) -> List[List[float]]:
     return resp.json()
 
 
-def _ensure_collection(client: QdrantClient) -> None:
+def _ensure_collection(client: Any) -> None:
     existing = [c.name for c in client.get_collections().collections]
     if COLLECTION_NAME not in existing:
         client.create_collection(
@@ -87,7 +98,7 @@ def _ensure_collection(client: QdrantClient) -> None:
     )
 
 
-def _get_client() -> Optional[QdrantClient]:
+def _get_client() -> Optional[Any]:
     global _qdrant_client, _qdrant_unavailable
     if not QDRANT_URL or not QDRANT_API_KEY:
         return None
@@ -95,6 +106,7 @@ def _get_client() -> Optional[QdrantClient]:
         return None
     if _qdrant_client is None:
         try:
+            QdrantClient = _import_qdrant()
             _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
             _ensure_collection(_qdrant_client)
         except Exception as e:

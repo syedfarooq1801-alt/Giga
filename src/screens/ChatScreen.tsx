@@ -259,6 +259,12 @@ const ChatScreen = () => {
 
   // State to hold all conversations
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  // Starts true so the sidebar shows a loading state instead of "No
+  // conversations yet." during the initial fetch -- on a cold Vercel
+  // function this can take several seconds, and an empty-looking sidebar
+  // during that window reads as "my account got wiped" rather than "still
+  // loading."
+  const [isLoadingConversations, setIsLoadingConversations] = useState(true);
 
   // Loads the user's conversations from the backend (single source of
   // truth -- the old direct-Firestore-write path here was disconnected
@@ -269,6 +275,7 @@ const ChatScreen = () => {
   // happens on a different screen and only updates the backend's most-
   // recent-conversation ordering, not this screen's already-mounted state.
   const restoreLastConversation = useCallback(async (pid: string, selectId?: string) => {
+    setIsLoadingConversations(true);
     try {
       const authInstance = getAuth();
       const idToken = await authInstance.currentUser?.getIdToken();
@@ -297,6 +304,8 @@ const ChatScreen = () => {
       console.error('[ChatScreen] Error loading conversations:', error);
       setConversations([]);
       setCurrentConversation(null);
+    } finally {
+      setIsLoadingConversations(false);
     }
   }, []);
 
@@ -1581,6 +1590,12 @@ const ChatScreen = () => {
     sidebarList: {
       flex: 1,
     },
+    sidebarLoading: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      paddingTop: 24,
+    },
     sidebarItem: {
       paddingVertical: 10,
       paddingHorizontal: 12,
@@ -1650,7 +1665,16 @@ const ChatScreen = () => {
                 </Text>
               </TouchableOpacity>
             )}
-            ListEmptyComponent={<Text style={[styles.emptyText, { fontSize: 13 }]}>No conversations yet.</Text>}
+            ListEmptyComponent={
+              isLoadingConversations ? (
+                <View style={styles.sidebarLoading}>
+                  <ActivityIndicator size="small" color={colors.sub} />
+                  <Text style={[styles.emptyText, { fontSize: 13 }]}>Loading chats...</Text>
+                </View>
+              ) : (
+                <Text style={[styles.emptyText, { fontSize: 13 }]}>No conversations yet.</Text>
+              )
+            }
           />
         </View>
       )}
