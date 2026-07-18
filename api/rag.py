@@ -57,28 +57,39 @@ def _import_qdrant():
 
 
 async def _embed_texts(texts: List[str]) -> List[List[float]]:
-    # Deliberately async and called directly from the event loop, NOT
-    # via asyncio.to_thread -- Vercel's sandboxed runtime hard-fails a
-    # SECOND outbound connection opened from the same worker thread that
-    # already opened one for Qdrant (_get_client() in the callers below),
-    # raising "[Errno 16] Device or resource busy" out of getaddrinfo on
-    # every attempt, not intermittently. Retrying in that same thread
-    # doesn't help since it's not transient. Running this on the main
-    # thread instead of a worker thread sidesteps the conflict entirely.
+    # Async and called directly from the event loop (not asyncio.to_thread)
+    # -- moving it off a worker thread wasn't enough on its own, though:
+    # Vercel's sandbox still throws "[Errno 16] Device or resource busy"
+    # here even on the main thread, because Firebase's own token
+    # verification (auth.verify_id_token, called just before this endpoint
+    # runs at all) already opens one outbound connection to
+    # identitytoolkit.googleapis.com earlier in the same invocation --
+    # this looks like the sandbox's outbound networking only tolerates
+    # one connection attempt at a time per invocation, not per-thread.
+    # A short wait-and-retry reliably clears it (that earlier connection
+    # finishes closing out).
     if not HF_API_TOKEN:
         raise RuntimeError("Document embeddings aren't configured (HF_API_TOKEN missing).")
     # wait_for_model=True makes HF block server-side until a cold model is
     # ready instead of returning a 503 -- simpler than a manual retry loop,
     # at the cost of a longer timeout on a cold start.
-    async with httpx.AsyncClient(timeout=45) as client:
-        resp = await client.post(
-            HF_EMBEDDING_URL,
-            headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
-            json={"inputs": texts, "options": {"wait_for_model": True}},
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
-    return resp.json()
+    last_error: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                resp = await client.post(
+                    HF_EMBEDDING_URL,
+                    headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+                    json={"inputs": texts, "options": {"wait_for_model": True}},
+                )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
+            return resp.json()
+        except httpx.TransportError as e:
+            last_error = e
+            logger.warning(f"Embedding request transport error (attempt {attempt + 1}/4): {e}")
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Embedding request failed after retries: {last_error}")
 
 
 def _ensure_collection(client: Any) -> None:
