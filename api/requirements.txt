@@ -3,6 +3,7 @@ pydantic==1.10.26
 python-dotenv==1.0.0
 firebase-admin==6.1.0
 httpx==0.24.0
+python-multipart==0.0.9
 slowapi==0.1.10
 qdrant-client==1.18.0
 pypdf==6.11.0
