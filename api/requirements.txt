@@ -8,13 +8,13 @@ slowapi==0.1.10
 qdrant-client==1.18.0
 pypdf==6.11.0
 
-# NOT listed here: sentence-transformers / torch / peft / transformers.
-# They power RAG's local embeddings (api/rag.py) and fine-tuned model
-# serving (api/local_llm.py) but are far too large for a serverless
-# function bundle -- install them separately for local dev
-# (pip install sentence-transformers peft; transformers comes in as a
-# dependency of sentence-transformers). Both modules import these lazily
-# and degrade gracefully (empty RAG results / Groq fallback, not a crash)
-# if they're missing, so a deploy without them still serves normal chat
-# correctly -- and LOCAL_MODEL_PATH being unset means local_llm.py is
-# fully inert regardless.
+# NOT listed here: torch / peft / transformers. They power the
+# fine-tuned model serving (api/local_llm.py) but are far too large for
+# a serverless function bundle -- install them separately for local dev
+# (pip install peft; transformers comes in as its dependency). That
+# module imports them lazily and LOCAL_MODEL_PATH being unset means
+# it's fully inert on a deploy without them, no crash.
+#
+# RAG's embeddings (api/rag.py) run via the HuggingFace Inference API
+# (HF_API_TOKEN) instead of a local model, so no heavy ML deps are
+# needed for that feature at all -- it works on a plain deploy.

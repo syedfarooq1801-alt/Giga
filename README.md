@@ -72,17 +72,20 @@ FIREBASE_SERVICE_ACCOUNT_JSON=./serviceAccountKey.json
 GROQ_API_KEY=...
 QDRANT_URL=...       # optional, for RAG
 QDRANT_API_KEY=...   # optional, for RAG
+HF_API_TOKEN=...     # optional, for RAG (hosted embeddings)
 ```
 
 Place your Firebase service account JSON at `api/serviceAccountKey.json` (gitignored).
 
 For full-stack local testing against the production build, use `npm run preview` (proxies `/api` to the backend, mirrors the Vercel routing).
 
-## RAG and fine-tuning (optional, local-dev only)
+## RAG and fine-tuning
 
-`sentence-transformers`/`torch`/`peft` are deliberately **not** in `api/requirements.txt` — they're too large for a serverless bundle. Install them separately if you want these features working locally:
+RAG (`api/rag.py`) embeds documents via the HuggingFace Inference API (`HF_API_TOKEN`) rather than a local model, so it works out of the box on any deploy, including Vercel — no extra install needed.
+
+Fine-tuned persona serving (`api/local_llm.py`) is the one local-dev-only piece: `torch`/`peft`/`transformers` are deliberately **not** in `api/requirements.txt` — too large for a serverless bundle. Install separately if you want it working locally:
 ```bash
-pip install sentence-transformers peft
+pip install peft
 ```
 Fine-tuning training itself runs in an isolated venv (`api/finetune/.venv`) so it can't disturb the main app's environment — see comments in `api/finetune/train_lora.py`.
 

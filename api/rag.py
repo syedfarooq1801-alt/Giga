@@ -1,18 +1,19 @@
-"""Local-embedding RAG over user-uploaded documents, backed by Qdrant Cloud.
+"""Hosted-embedding RAG over user-uploaded documents, backed by Qdrant Cloud.
 
-Embeddings run locally (sentence-transformers, CPU -- this keeps GPU VRAM
-free for the fine-tuned model in api/local_llm.py, and means this module
-works identically on a GPU-less deploy). Qdrant is the ONLY place vectors
-live; Firestore (api/firebase_memory_manager.py) separately tracks "what
-did this user upload" as plain metadata, since Qdrant isn't a good
-system-of-record for that.
+Embeddings run via the HuggingFace Inference API (a plain HTTP call), not a
+locally-loaded model -- sentence-transformers/torch are far too large for a
+serverless bundle, so this module stays deployable on Vercel with zero heavy
+ML deps. Qdrant is the ONLY place vectors live; Firestore
+(api/firebase_memory_manager.py) separately tracks "what did this user
+upload" as plain metadata, since Qdrant isn't a good system-of-record for
+that.
 
 Every function that runs inside the live chat request path
-(search_context) MUST degrade gracefully -- if Qdrant is unreachable, or
-its free-tier cluster has paused from inactivity, a chat message should
-still get a normal (non-RAG) reply, not a 500. Upload/delete are explicit
-user actions, not silent background augmentation, so those DO raise -- the
-user should know if their upload actually failed.
+(search_context) MUST degrade gracefully -- if Qdrant or the embedding API
+is unreachable, a chat message should still get a normal (non-RAG) reply,
+not a 500. Upload/delete are explicit user actions, not silent background
+augmentation, so those DO raise -- the user should know if their upload
+actually failed.
 """
 
 import asyncio
@@ -23,6 +24,7 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
@@ -30,32 +32,34 @@ logger = logging.getLogger("rag")
 
 QDRANT_URL = os.environ.get("QDRANT_URL")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 COLLECTION_NAME = "documents"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+HF_EMBEDDING_URL = f"https://api-inference.huggingface.co/models/sentence-transformers/{EMBEDDING_MODEL_NAME}"
 EMBEDDING_DIM = 384
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 TOP_K = 3
 
-_embedding_model = None
 _qdrant_client: Optional[QdrantClient] = None
 _qdrant_unavailable = False  # sticky after first failed connect, avoids retrying every request
 
 
-def _get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        # Force offline/local-cache-only: with the model already cached
-        # (first run downloads it), there's no reason a chat-serving process
-        # should ever make a network call to HuggingFace Hub just to check
-        # for updates. That check has been observed to hang for a long time
-        # under network contention (e.g. a concurrent batch job also making
-        # heavy outbound calls) -- offline mode removes the network call
-        # entirely rather than just hoping it's fast.
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
-    return _embedding_model
+def _embed_texts(texts: List[str]) -> List[List[float]]:
+    if not HF_API_TOKEN:
+        raise RuntimeError("Document embeddings aren't configured (HF_API_TOKEN missing).")
+    # wait_for_model=True makes HF block server-side until a cold model is
+    # ready instead of returning a 503 -- simpler than a manual retry loop,
+    # at the cost of a longer timeout on a cold start.
+    resp = httpx.post(
+        HF_EMBEDDING_URL,
+        headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+        json={"inputs": texts, "options": {"wait_for_model": True}},
+        timeout=45,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")
+    return resp.json()
 
 
 def _ensure_collection(client: QdrantClient) -> None:
@@ -146,14 +150,13 @@ def _sync_upload_document(profile_id: str, filename: str, content: bytes) -> Dic
     if not chunks:
         raise ValueError("No extractable text found in this document.")
 
-    model = _get_embedding_model()
-    embeddings = model.encode(chunks, show_progress_bar=False)
+    embeddings = _embed_texts(chunks)
 
     doc_id = str(uuid.uuid4())
     points = [
         qmodels.PointStruct(
             id=str(uuid.uuid4()),
-            vector=embeddings[i].tolist(),
+            vector=embeddings[i],
             payload={
                 "profile_id": profile_id,
                 "doc_id": doc_id,
@@ -202,8 +205,7 @@ def _sync_search_context(profile_id: str, query_text: str, top_k: int) -> List[s
     if client is None:
         return []
     try:
-        model = _get_embedding_model()
-        query_vector = model.encode([query_text])[0].tolist()
+        query_vector = _embed_texts([query_text])[0]
         # qdrant-client >=1.10 deprecated .search() in favor of
         # .query_points() -- same idea (vector + filter -> ranked hits),
         # response is a QueryResponse wrapping .points instead of a bare list.
