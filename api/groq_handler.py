@@ -6,6 +6,13 @@ import logging
 from typing import AsyncGenerator
 from config import GROQ_API_KEY, GROQ_API_URL
 
+# llama-3.3-70b-versatile started 404ing ("does not exist or you do not
+# have access to it") -- Groq deprecated/renamed it. Reusing the vision
+# model here instead of guessing a new plain-chat model name: it's already
+# confirmed working on this account (see get_groq_vision_response below),
+# and it's Llama 4 class, so no quality downgrade either.
+CHAT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
 async def get_groq_response(messages: list):
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -37,7 +44,7 @@ async def get_groq_response(messages: list):
     max_tokens = min(2048, max(100, max_allowed_tokens - estimated_input_tokens))
     
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": CHAT_MODEL,
         "messages": final_messages,
         "temperature": 0.7,
         "max_tokens": max_tokens,
@@ -174,7 +181,7 @@ async def get_groq_response_stream(messages: list) -> AsyncGenerator[str, None]:
     max_tokens = min(2048, max(100, max_allowed_tokens - estimated_input_tokens))
 
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": CHAT_MODEL,
         "messages": final_messages,
         "temperature": 0.7,
         "max_tokens": max_tokens,
