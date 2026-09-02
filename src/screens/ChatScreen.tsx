@@ -25,6 +25,14 @@ import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import { StackNavigationProp } from '@react-navigation/stack';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { useAuth } from '../hooks/useAuth';
+import { useGuest } from '../contexts/GuestContext';
+import {
+  getGuestConversations,
+  saveGuestConversations,
+  getGuestMessages,
+  saveGuestMessages,
+} from '../services/guestSession';
+import { sendGuestMessageStream } from '../services/guestChat';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MaterialCommunityIcons, MaterialIcons as Icon } from '@expo/vector-icons';
 import { MessageBubble } from '../components/MessageBubble';
@@ -232,6 +240,7 @@ const ChatScreen = () => {
   const { width: windowWidth } = useWindowDimensions();
   const isWideScreen = Platform.OS === 'web' && windowWidth >= 900;
   const { session, loading: authLoading } = useAuth();
+  const { isGuest: isGuestSession, guestId } = useGuest();
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const navigation = useNavigation<StackNavigationProp<RootStackParamList, 'Chat'>>();
   const flatListRef = useRef<any>(null);
@@ -324,12 +333,30 @@ const ChatScreen = () => {
       setUserId(session.user.uid);
       console.log('Profile ID set:', session.profileId, 'User ID set:', session.user.uid);
       restoreLastConversation(session.profileId);
-    } else if (!authLoading && !session) {
+    } else if (!authLoading && !session && !isGuestSession) {
       setProfileId(null);
       setUserId(null);
       setCurrentConversation(null);
     }
-  }, [session, authLoading, restoreLastConversation]);
+  }, [session, authLoading, restoreLastConversation, isGuestSession]);
+
+  // Guest-mode equivalent of the effect above -- profileId/userId both
+  // become the local guestId (everything downstream just checks these for
+  // truthiness, so reusing the same fields keeps most of the screen
+  // guest-agnostic), and the conversation list comes from AsyncStorage
+  // instead of GET /api/conversations.
+  useEffect(() => {
+    if (!isGuestSession || !guestId) return;
+    setProfileId(guestId);
+    setUserId(guestId);
+    (async () => {
+      setIsLoadingConversations(true);
+      const local = await getGuestConversations();
+      setConversations(local);
+      setCurrentConversation(local[0] || null);
+      setIsLoadingConversations(false);
+    })();
+  }, [isGuestSession, guestId]);
 
   // Only acts when a conversation was just forked elsewhere (shared-chat
   // "Continue this chat") -- an ordinary tab switch back to Chat is a no-op,
@@ -355,7 +382,10 @@ const ChatScreen = () => {
   // undefined instead of '' to the backend and adopts whatever id comes back.
   const createNewConversation = (): Conversation => {
     const conversation: Conversation = {
-      id: '',
+      // Guests have no backend to lazily mint an id on first send -- a
+      // conversation only ever exists in AsyncStorage, so it needs a real
+      // id up front.
+      id: isGuestSession ? `guest-conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}` : '',
       title: `New ${selectedPersonality.name} Chat`,
       lastMessage: '',
       timestamp: new Date(),
@@ -444,8 +474,121 @@ const ChatScreen = () => {
     setPendingImage({ dataUrl: `data:${mimeType};base64,${asset.base64}` });
   };
 
+  // Guest mode's send flow -- deliberately kept separate from the
+  // authenticated one below rather than threading isGuestSession branches
+  // through it: guest chat is simpler (no Firestore, no messageDocId, no
+  // image/RAG turns, streaming-only) and this way the existing,
+  // well-exercised authenticated path is untouched. History for the
+  // backend is just what's already on screen, since a guest conversation
+  // lives only in this component's state + AsyncStorage.
+  const handleSendGuestMessage = async (text: string) => {
+    if (!guestId || !text.trim()) return;
+
+    const isFirstMessageInConversation = messages.length === 0;
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const now = new Date();
+
+    const conversationToUse = currentConversation ?? createNewConversation();
+    const convId = conversationToUse.id;
+
+    const history = messages
+      .map(m => ({ role: (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant', content: m.text }))
+      .filter(m => m.content.trim());
+
+    const tempUserMessage: ChatMessage = {
+      id: tempId,
+      text: text.trim(),
+      userId: guestId,
+      sender: 'user',
+      timestamp: now,
+      personalityId: selectedPersonality.id,
+      profileId: guestId,
+      conversationId: convId,
+      isOptimistic: true,
+    };
+    setMessages(prev => [...prev, tempUserMessage]);
+    setInputText('');
+    setIsTyping(true);
+    isNearBottomRef.current = true;
+
+    const streamId = `stream-${Date.now()}`;
+    const streamPlaceholder: ChatMessage = {
+      id: streamId,
+      text: '',
+      userId: 'ai',
+      sender: 'assistant',
+      timestamp: new Date(now.getTime() + 1),
+      personalityId: selectedPersonality.id,
+      profileId: guestId,
+      conversationId: convId,
+    };
+    let firstChunkReceived = false;
+
+    try {
+      const streamResult = await sendGuestMessageStream(
+        tempUserMessage.text,
+        selectedPersonality.id,
+        history,
+        (chunk) => {
+          if (!firstChunkReceived) {
+            firstChunkReceived = true;
+            setIsTyping(false);
+            setMessages(prev => [...prev, streamPlaceholder]);
+          }
+          setMessages(prev => prev.map(msg => (msg.id === streamId ? { ...msg, text: msg.text + chunk } : msg)));
+        }
+      );
+
+      setIsTyping(false);
+      const finalText = streamResult?.fullText || 'Sorry, the AI could not generate a response.';
+
+      // Computed directly rather than read back out of a setMessages
+      // updater -- React doesn't guarantee that updater runs synchronously,
+      // so a value assigned inside one and read immediately after the call
+      // can still be stale (this saved an empty array to AsyncStorage on
+      // first test). `messages` (closure) is safe to build on here: guest
+      // mode has no concurrent writer that could have changed it since
+      // this function started.
+      const finalMessages: ChatMessage[] = [
+        ...messages,
+        tempUserMessage,
+        { ...streamPlaceholder, text: finalText },
+      ];
+      setMessages(finalMessages);
+
+      const updatedConversation: Conversation = {
+        ...conversationToUse,
+        lastMessage: finalText,
+        timestamp: streamPlaceholder.timestamp,
+        personalityId: selectedPersonality.id,
+        title: isFirstMessageInConversation ? tempUserMessage.text.slice(0, 40) : conversationToUse.title,
+      };
+      setCurrentConversation(updatedConversation);
+
+      // Guest conversations exist ONLY in AsyncStorage -- this is the one
+      // and only place they get persisted.
+      setConversations(prev => {
+        const exists = prev.some(c => c.id === updatedConversation.id);
+        const next = exists
+          ? prev.map(c => (c.id === updatedConversation.id ? updatedConversation : c))
+          : [updatedConversation, ...prev];
+        void saveGuestConversations(next);
+        return next;
+      });
+      void saveGuestMessages(updatedConversation.id, finalMessages);
+    } catch (streamError) {
+      console.error('Error streaming guest message:', streamError);
+      setIsTyping(false);
+      setMessages(prev => prev.filter(msg => msg.id !== streamId));
+      Toast.show({ type: 'error', text1: 'Failed to send message', text2: 'Check your connection and try again.', position: 'bottom' });
+    }
+  };
+
   const handleSendMessage = async (text: string) => {
     if (!profileId || !userId || (!text.trim() && !pendingImage)) return;
+    if (isGuestSession) {
+      return handleSendGuestMessage(text);
+    }
 
     console.log('Sending message:', { text, profileId, userId });
 
@@ -803,6 +946,15 @@ const ChatScreen = () => {
       setMessages([]);
       return;
     }
+    if (isGuestSession) {
+      setIsLoadingMessages(true);
+      try {
+        setMessages(await getGuestMessages(currentConversation.id));
+      } finally {
+        setIsLoadingMessages(false);
+      }
+      return;
+    }
     setIsLoadingMessages(true);
     try {
       const authInstance = getAuth();
@@ -843,7 +995,7 @@ const ChatScreen = () => {
     } finally {
       setIsLoadingMessages(false);
     }
-  }, [profileId, userId, currentConversation?.id]);
+  }, [profileId, userId, currentConversation?.id, isGuestSession]);
 
   // Effect to load messages when profileId or the ACTIVE conversation
   // changes. Deliberately depends on currentConversation?.id, not the
@@ -1772,7 +1924,7 @@ const ChatScreen = () => {
         selectedPersonality={selectedPersonality}
         onSelectPersonality={handlePersonalitySelect}
         isDefaultPersonality={selectedPersonality.id === DEFAULT_PERSONALITY_ID}
-        onShare={currentConversation?.id ? handleShare : undefined}
+        onShare={!isGuestSession && currentConversation?.id ? handleShare : undefined}
         hideMenuButton={isWideScreen}
       />
       {!isOnline && (
@@ -1842,53 +1994,57 @@ const ChatScreen = () => {
         </View>
       )}
       <View style={styles.inputContainer}>
-        <View>
-          {showAttachMenu && (
-            <>
-              <TouchableOpacity
-                style={styles.attachMenuBackdrop}
-                activeOpacity={1}
-                onPress={() => setShowAttachMenu(false)}
-              />
-              <View style={[styles.attachMenu, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-                <TouchableOpacity style={styles.attachMenuItem} onPress={handleAttachImage}>
-                  <MaterialCommunityIcons name="image-outline" size={18} color={colors.ink} />
-                  <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Photo</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.attachMenuItem} onPress={handleAttachDocument}>
-                  <MaterialCommunityIcons name="file-document-outline" size={18} color={colors.ink} />
-                  <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Document</Text>
-                </TouchableOpacity>
+        {/* Guest mode is basic chat only -- no RAG/uploads (needs a real
+            account for Qdrant/Firestore-backed document storage). */}
+        {!isGuestSession && (
+          <View>
+            {showAttachMenu && (
+              <>
                 <TouchableOpacity
-                  style={styles.attachMenuItem}
-                  onPress={() => {
-                    setUseDocuments(prev => !prev);
-                    setShowAttachMenu(false);
-                  }}
-                >
-                  <MaterialCommunityIcons
-                    name={useDocuments ? 'checkbox-marked' : 'checkbox-blank-outline'}
-                    size={18}
-                    color={useDocuments ? accentColor : colors.ink}
-                  />
-                  <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Use my documents</Text>
-                </TouchableOpacity>
-              </View>
-            </>
-          )}
-          <TouchableOpacity
-            onPress={() => setShowAttachMenu(prev => !prev)}
-            disabled={isUploadingDoc}
-            style={[styles.docsToggle, useDocuments && { backgroundColor: accentColor }]}
-            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-          >
-            {isUploadingDoc ? (
-              <ActivityIndicator size="small" color={colors.sub} />
-            ) : (
-              <MaterialCommunityIcons name="paperclip" size={18} color={useDocuments ? colors.accentContrast : colors.sub} />
+                  style={styles.attachMenuBackdrop}
+                  activeOpacity={1}
+                  onPress={() => setShowAttachMenu(false)}
+                />
+                <View style={[styles.attachMenu, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+                  <TouchableOpacity style={styles.attachMenuItem} onPress={handleAttachImage}>
+                    <MaterialCommunityIcons name="image-outline" size={18} color={colors.ink} />
+                    <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Photo</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.attachMenuItem} onPress={handleAttachDocument}>
+                    <MaterialCommunityIcons name="file-document-outline" size={18} color={colors.ink} />
+                    <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Document</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.attachMenuItem}
+                    onPress={() => {
+                      setUseDocuments(prev => !prev);
+                      setShowAttachMenu(false);
+                    }}
+                  >
+                    <MaterialCommunityIcons
+                      name={useDocuments ? 'checkbox-marked' : 'checkbox-blank-outline'}
+                      size={18}
+                      color={useDocuments ? accentColor : colors.ink}
+                    />
+                    <Text style={[styles.attachMenuLabel, { color: colors.ink }]}>Use my documents</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
             )}
-          </TouchableOpacity>
-        </View>
+            <TouchableOpacity
+              onPress={() => setShowAttachMenu(prev => !prev)}
+              disabled={isUploadingDoc}
+              style={[styles.docsToggle, useDocuments && { backgroundColor: accentColor }]}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              {isUploadingDoc ? (
+                <ActivityIndicator size="small" color={colors.sub} />
+              ) : (
+                <MaterialCommunityIcons name="paperclip" size={18} color={useDocuments ? colors.accentContrast : colors.sub} />
+              )}
+            </TouchableOpacity>
+          </View>
+        )}
         <View>
           {showEmojiMenu && (
             <>
@@ -1958,28 +2114,31 @@ const ChatScreen = () => {
             }
           }}
         />
-        <TouchableOpacity
-          style={[
-            styles.micButton,
-            isListening && styles.micButtonActive,
-            (isTyping || isTtsPlaying) && styles.micButtonDisabled,
-            isTtsPlaying && styles.stopButton,
-          ]}
-          onPress={handleMicPress}
-          disabled={isTyping}
-        >
-          {isTtsPlaying ? (
-            <View style={styles.stopIcon}>
-              <View style={styles.stopIconInner} />
-            </View>
-          ) : (
-            <Icon
-              name={isListening ? 'stop' : 'mic'}
-              size={20}
-              color={isTyping ? colors.sub : isListening ? colors.accentContrast : colors.ink}
-            />
-          )}
-        </TouchableOpacity>
+        {/* Voice is excluded from guest mode's basic-chat scope. */}
+        {!isGuestSession && (
+          <TouchableOpacity
+            style={[
+              styles.micButton,
+              isListening && styles.micButtonActive,
+              (isTyping || isTtsPlaying) && styles.micButtonDisabled,
+              isTtsPlaying && styles.stopButton,
+            ]}
+            onPress={handleMicPress}
+            disabled={isTyping}
+          >
+            {isTtsPlaying ? (
+              <View style={styles.stopIcon}>
+                <View style={styles.stopIconInner} />
+              </View>
+            ) : (
+              <Icon
+                name={isListening ? 'stop' : 'mic'}
+                size={20}
+                color={isTyping ? colors.sub : isListening ? colors.accentContrast : colors.ink}
+              />
+            )}
+          </TouchableOpacity>
+        )}
         <TouchableOpacity
           style={[
             styles.sendButton,

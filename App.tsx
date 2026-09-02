@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import { Navigation } from './src/navigation';
 import { AuthProvider } from './src/contexts/FirebaseAuthContext';
+import { GuestProvider } from './src/contexts/GuestContext';
 import { ThemeProvider } from './src/contexts/ThemeContext';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { View, Platform } from 'react-native';
@@ -37,12 +38,14 @@ export default function App() {
     <SafeAreaProvider>
       <ThemeProvider>
         <AuthProvider>
-          <ConversationProvider>
-            <View style={{ flex: 1, minHeight: 0, height: '100%' }}>
-              <Navigation />
-              <Toast />
-            </View>
-          </ConversationProvider>
+          <GuestProvider>
+            <ConversationProvider>
+              <View style={{ flex: 1, minHeight: 0, height: '100%' }}>
+                <Navigation />
+                <Toast />
+              </View>
+            </ConversationProvider>
+          </GuestProvider>
         </AuthProvider>
       </ThemeProvider>
     </SafeAreaProvider>

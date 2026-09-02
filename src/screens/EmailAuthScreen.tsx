@@ -12,8 +12,12 @@ import {
   Keyboard,
 } from 'react-native';
 
+import { getAuth } from 'firebase/auth';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/FirebaseAuthContext';
+import { useGuest } from '../contexts/GuestContext';
+import { collectGuestDataForMigration } from '../services/guestSession';
+import { migrateGuestConversations } from '../services/guestChat';
 import { Ionicons } from '@expo/vector-icons';
 
 type AuthMode = 'login' | 'signup';
@@ -37,8 +41,21 @@ const EmailAuthScreen = () => {
   const scrollViewRef = useRef<any>(null);
 
   const { signInWithEmail, signUpWithEmail, sendPasswordResetEmail } = useAuth();
+  const { isGuest, enterGuestMode, exitGuestMode } = useGuest();
+  const [guestLoading, setGuestLoading] = useState(false);
   const { colors, radius, typography } = useTheme();
   const styles = makeStyles(colors, radius, typography);
+
+  const handleContinueAsGuest = async () => {
+    setGuestLoading(true);
+    try {
+      await enterGuestMode();
+      // No navigation call needed -- Navigation itself swaps to the Main
+      // stack the moment isGuest flips true (same mechanism as signing in).
+    } finally {
+      setGuestLoading(false);
+    }
+  };
 
   useEffect(() => {
     Keyboard.dismiss(); // Dismiss keyboard on mode change
@@ -62,6 +79,31 @@ const EmailAuthScreen = () => {
     }
   };
 
+  // Runs after a successful login -- if this browser has guest chats
+  // sitting in AsyncStorage (from before this sign-in, or from a signup
+  // that then forced a re-login), upload them into the now-real account
+  // and clear local guest state. Best-effort: a failed migration leaves
+  // guest data in place rather than losing it, so it can be retried on
+  // the next login instead of silently vanishing.
+  const migrateGuestDataIfAny = async () => {
+    if (!isGuest) return;
+    try {
+      const payload = await collectGuestDataForMigration();
+      if (payload.conversations.length === 0) {
+        await exitGuestMode();
+        return;
+      }
+      const idToken = await getAuth().currentUser?.getIdToken();
+      if (!idToken) return;
+      const result = await migrateGuestConversations(idToken, payload);
+      if (result) {
+        await exitGuestMode();
+      }
+    } catch (e) {
+      console.warn('[EmailAuthScreen] Guest migration failed, will retry next login:', e);
+    }
+  };
+
   const handleSubmit = async () => {
     try {
       setLoading(true);
@@ -70,6 +112,7 @@ const EmailAuthScreen = () => {
       if (mode === 'login') {
         await signInWithEmail(email, password);
         // Navigation will be handled by parent on auth state change
+        await migrateGuestDataIfAny();
       } else {
         // signup mode
         if (password !== confirmPassword) {
@@ -323,6 +366,27 @@ const EmailAuthScreen = () => {
               {mode === 'login' ? "Don't have an account? Sign Up" : 'Already have an account? Log In'}
             </Text>
           </TouchableOpacity>
+
+          <View style={styles.guestDivider}>
+            <View style={styles.guestDividerLine} />
+            <Text style={styles.guestDividerText}>or</Text>
+            <View style={styles.guestDividerLine} />
+          </View>
+
+          <TouchableOpacity
+            style={[styles.guestButton, { opacity: guestLoading ? 0.6 : 1 }]}
+            onPress={handleContinueAsGuest}
+            disabled={guestLoading}
+          >
+            {guestLoading ? (
+              <ActivityIndicator color={colors.ink} />
+            ) : (
+              <Text style={styles.guestButtonText}>Continue as guest</Text>
+            )}
+          </TouchableOpacity>
+          <Text style={styles.guestHint}>
+            Basic chat only, stored on this device. Sign in anytime to save it to your account.
+          </Text>
         </View>
       </ScrollView>
     </KeyboardAvoidingView>
@@ -376,6 +440,21 @@ const makeStyles = (colors: any, radius: any, typography: any) =>
     linkText: { fontSize: typography.size.sm, fontWeight: typography.weight.medium, color: colors.accent },
     switchModeButton: { marginTop: 16, padding: 12, alignItems: 'center' },
     switchModeText: { fontSize: typography.size.sm, fontWeight: typography.weight.medium, color: colors.accent },
+    guestDivider: { flexDirection: 'row', alignItems: 'center', marginTop: 12, marginBottom: 4 },
+    guestDividerLine: { flex: 1, height: 1, backgroundColor: colors.line },
+    guestDividerText: { marginHorizontal: 10, fontSize: typography.size.sm, color: colors.sub },
+    guestButton: {
+      marginTop: 8,
+      padding: 15,
+      borderRadius: radius.pill,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderWidth: 1,
+      borderColor: colors.line,
+      backgroundColor: colors.surface,
+    },
+    guestButtonText: { color: colors.ink, fontSize: typography.size.base, fontWeight: typography.weight.bold },
+    guestHint: { marginTop: 10, fontSize: 12, color: colors.sub, textAlign: 'center' },
     errorContainer: {
       backgroundColor: colors.dangerBg,
       padding: 12,

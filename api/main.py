@@ -1194,6 +1194,185 @@ async def chat(
         return error_response
 
 
+GUEST_HISTORY_LIMIT = 20  # how much client-supplied history we forward to the LLM
+
+
+def _build_guest_messages(message: str, personality: str, history: list) -> list:
+    """Guest-mode equivalent of _build_chat_messages -- no Firestore, no A/B
+    variant, no RAG. History comes entirely from the client (guest
+    conversations only ever live in browser storage, see
+    src/services/guestChat.ts), so it's capped and sanity-checked here
+    since it's unauthenticated, client-controlled input."""
+    personality_context = get_personality_context(personality)
+    messages = []
+    if personality_context and isinstance(personality_context, list):
+        for msg in personality_context:
+            if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                messages.append({
+                    "role": msg['role'],
+                    "content": str(msg['content']) if not isinstance(msg['content'], str) else msg['content'],
+                })
+
+    if isinstance(history, list):
+        for msg in history[-GUEST_HISTORY_LIMIT:]:
+            if isinstance(msg, dict) and msg.get('role') in ('user', 'assistant') and isinstance(msg.get('content'), str):
+                messages.append({"role": msg['role'], "content": msg['content'][:2000]})
+
+    messages.append({"role": "user", "content": message})
+    if messages[-1]['role'] not in ("user", "tool"):
+        messages.append({"role": "user", "content": message})
+    return messages
+
+
+async def _stream_groq_sentences(messages: list, user_message: str, personality: str, result: Dict[str, Any]):
+    """Shared sentence-buffered SSE streaming core for /chat/stream and
+    /guest/chat/stream -- yields already-formatted `data: ...` SSE lines.
+    The accumulated full response text is written into `result` (a plain
+    dict the caller passes in) once the stream ends, since an async
+    generator being consumed with `async for` can't also hand back a
+    return value the normal way."""
+    sentence_boundary = re.compile(r'(?<=[.!?])\s+')
+    buffer = ""
+    full_response = ""
+    try:
+        async for delta in get_groq_response_stream(messages):
+            buffer += delta
+            parts = sentence_boundary.split(buffer)
+            # Keep the last (possibly incomplete) fragment in the buffer;
+            # flush every complete sentence before it.
+            buffer = parts[-1]
+            for sentence in parts[:-1]:
+                cleaned = _clean_response_sentence(sentence, user_message, personality)
+                if cleaned:
+                    full_response += cleaned + " "
+                    yield f"data: {json.dumps({'text': cleaned + ' '})}\n\n"
+
+        # Flush whatever's left (text that never hit a sentence boundary)
+        if buffer.strip():
+            cleaned = _clean_response_sentence(buffer, user_message, personality)
+            if cleaned:
+                full_response += cleaned
+                yield f"data: {json.dumps({'text': cleaned})}\n\n"
+
+    except Exception as e:
+        logger.error(f"Error in streaming generator: {str(e)}")
+        logger.error(traceback.format_exc())
+        if not full_response.strip():
+            fallback = "Hmm, let me think of a better response. Try asking me something else!"
+            full_response = fallback
+            yield f"data: {json.dumps({'text': fallback})}\n\n"
+
+    result['full_response'] = full_response.strip() or "Sorry, the AI could not generate a response."
+
+
+@api_app.post("/guest/chat/stream")
+@api_app.options("/guest/chat/stream", include_in_schema=False)
+@limiter.limit("10/minute")
+async def guest_chat_stream(request: Request, origin: str = Header(None, include_in_schema=False)):
+    """Unauthenticated counterpart to /chat/stream for guest mode -- basic
+    text chat only (no RAG, vision, voice, fine-tuned model, or Firestore
+    reads/writes of any kind). The client supplies its own recent message
+    history since guest conversations live entirely in browser storage,
+    not in a Firestore chat doc the server could fetch. Rate limited
+    tighter than the authenticated endpoint (10/min vs 20/min) since this
+    is reachable with zero auth -- _rate_limit_key falls back to
+    IP-based limiting here (no bearer token to key on), protecting the
+    shared Groq quota from anonymous abuse.
+    """
+    cors_headers = {
+        "Access-Control-Allow-Origin": origin or "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Credentials": "true",
+    }
+
+    if request.method == "OPTIONS":
+        return JSONResponse(content={"message": "OK"}, status_code=200, headers=cors_headers)
+
+    data = await request.json()
+    message = data.get("message")
+    personality = data.get("personality", "swag")
+    history = data.get("history", [])
+
+    if not message or not isinstance(message, str):
+        return JSONResponse(content={"message": "Message is required"}, status_code=400, headers=cors_headers)
+    if len(message) > 4000:
+        return JSONResponse(content={"message": "Message is too long"}, status_code=400, headers=cors_headers)
+
+    logger.info(f"Guest stream chat request - Personality: {personality}")
+
+    async def event_generator():
+        messages = _build_guest_messages(message, personality, history)
+        result: Dict[str, Any] = {}
+        async for line in _stream_groq_sentences(messages, message, personality, result):
+            yield line
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={**cors_headers, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class GuestMigrateMessage(BaseModel):
+    text: str
+    sender: str  # 'user' | 'assistant'
+
+
+class GuestMigrateConversation(BaseModel):
+    title: Optional[str] = None
+    personality: str = "swag"
+    messages: List[GuestMigrateMessage] = []
+
+
+class GuestMigrateRequest(BaseModel):
+    conversations: List[GuestMigrateConversation] = []
+
+
+@api_app.post("/guest/migrate")
+@limiter.limit("5/minute")
+async def migrate_guest_conversations(
+    request: Request, body: GuestMigrateRequest, current_user: dict = Depends(get_current_user)
+):
+    """One-time import of a guest's browser-only conversations into
+    Firestore, called right after a guest signs in/up (see
+    FirebaseAuthContext). Guest chats never touch the backend at all
+    until this runs -- pairs up consecutive user/assistant messages and
+    replays them through store_message so a migrated conversation ends up
+    in the exact same shape as one built the normal way."""
+    user_id = current_user.get('uid')
+    profile_id = current_user.get('profile_id')
+    migrated = 0
+    for conv in body.conversations:
+        chat_id = None
+        pending_user_msg: Optional[str] = None
+        for m in conv.messages:
+            if m.sender == 'user':
+                pending_user_msg = m.text
+            elif m.sender == 'assistant' and pending_user_msg is not None:
+                try:
+                    chat_id, _ = await store_message(
+                        user_id=user_id,
+                        profile_id=profile_id,
+                        personality=conv.personality,
+                        message=pending_user_msg,
+                        response=m.text,
+                        chat_id=chat_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"Guest migration: failed to store a message pair: {e}")
+                pending_user_msg = None
+        if chat_id and conv.title:
+            try:
+                await update_chat_title(chat_id, user_id, title=conv.title, profile_id=profile_id)
+            except Exception as e:
+                logger.warning(f"Guest migration: failed to set title: {e}")
+        if chat_id:
+            migrated += 1
+    return {"migrated": migrated}
+
+
 @api_app.post("/chat/stream")
 @api_app.options("/chat/stream", include_in_schema=False)
 @limiter.limit("20/minute")
@@ -1237,45 +1416,22 @@ async def chat_stream(
     logger.info(f"Stream chat request - User: {current_user.get('uid')}, Conversation: {conversation_id}, Personality: {personality}")
 
     async def event_generator():
-        sentence_boundary = re.compile(r'(?<=[.!?])\s+')
-        buffer = ""
-        full_response = ""
         user_id = None
         profile_id = None
+        full_response = "Sorry, the AI could not generate a response."
 
         try:
             messages, user_id, profile_id = await _build_chat_messages(
                 message, personality, conversation_id, current_user, rag_override=use_documents
             )
-
-            async for delta in get_groq_response_stream(messages):
-                buffer += delta
-                parts = sentence_boundary.split(buffer)
-                # Keep the last (possibly incomplete) fragment in the buffer;
-                # flush every complete sentence before it.
-                buffer = parts[-1]
-                for sentence in parts[:-1]:
-                    cleaned = _clean_response_sentence(sentence, message, personality)
-                    if cleaned:
-                        full_response += cleaned + " "
-                        yield f"data: {json.dumps({'text': cleaned + ' '})}\n\n"
-
-            # Flush whatever's left (text that never hit a sentence boundary)
-            if buffer.strip():
-                cleaned = _clean_response_sentence(buffer, message, personality)
-                if cleaned:
-                    full_response += cleaned
-                    yield f"data: {json.dumps({'text': cleaned})}\n\n"
-
+            result: Dict[str, Any] = {}
+            async for line in _stream_groq_sentences(messages, message, personality, result):
+                yield line
+            full_response = result.get('full_response', full_response)
         except Exception as e:
             logger.error(f"Error in /chat/stream generator: {str(e)}")
             logger.error(traceback.format_exc())
-            if not full_response.strip():
-                fallback = "Hmm, let me think of a better response. Try asking me something else!"
-                full_response = fallback
-                yield f"data: {json.dumps({'text': fallback})}\n\n"
-
-        full_response = full_response.strip() or "Sorry, the AI could not generate a response."
+            yield f"data: {json.dumps({'text': full_response})}\n\n"
 
         # Store the conversation + refresh compressed memory, same as /chat —
         # needs the full accumulated text, so this runs after the stream ends.

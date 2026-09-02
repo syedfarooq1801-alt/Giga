@@ -8,6 +8,7 @@ import { SettingsScreen } from '../screens/SettingsScreen';
 import AuthScreen from '../screens/AuthScreen';
 import { SharedConversationScreen } from '../screens/SharedConversationScreen';
 import { useAuth } from '../contexts/FirebaseAuthContext';
+import { useGuest } from '../contexts/GuestContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -88,9 +89,9 @@ const MainTabs = () => {
           ),
         }}
       >
-        {(props) => (
+        {() => (
           <FadeInScreen>
-            <ChatScreen {...props} />
+            <ChatScreen />
           </FadeInScreen>
         )}
       </Tab.Screen>
@@ -102,9 +103,9 @@ const MainTabs = () => {
           ),
         }}
       >
-        {(props) => (
+        {() => (
           <FadeInScreen>
-            <SettingsScreen {...props} />
+            <SettingsScreen />
           </FadeInScreen>
         )}
       </Tab.Screen>
@@ -128,18 +129,20 @@ const styles = StyleSheet.create({
 
 export const Navigation = () => {
   const { user, loading } = useAuth();
+  const { isGuest, loading: guestLoading } = useGuest();
   const { colors } = useTheme();
   const [isInitialLoading, setIsInitialLoading] = React.useState(true);
+  const authResolved = !loading && !guestLoading;
 
   // Reset initial loading after first render
   React.useEffect(() => {
-    if (!loading) {
+    if (authResolved) {
       const timer = setTimeout(() => {
         setIsInitialLoading(false);
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [loading]);
+  }, [authResolved]);
 
   // Show loading screen during initial load
   if (isInitialLoading) {
@@ -156,7 +159,7 @@ export const Navigation = () => {
           animationEnabled: false,
         }}
       >
-        {user ? (
+        {user || isGuest ? (
           <Stack.Screen
             name="Main"
             component={MainTabs}
