@@ -6,12 +6,13 @@ import logging
 from typing import AsyncGenerator
 from config import GROQ_API_KEY, GROQ_API_URL
 
-# llama-3.3-70b-versatile started 404ing ("does not exist or you do not
-# have access to it") -- Groq deprecated/renamed it. Reusing the vision
-# model here instead of guessing a new plain-chat model name: it's already
-# confirmed working on this account (see get_groq_vision_response below),
-# and it's Llama 4 class, so no quality downgrade either.
-CHAT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Both llama-3.3-70b-versatile and meta-llama/llama-4-scout-17b-16e-instruct
+# 404 on this account with "does not exist or you do not have access to
+# it" -- per Groq's model catalog the Llama-family models sit behind a
+# "Contact Sales" rate-limit tier this key doesn't have, while the
+# gpt-oss models publish real limits (250K TPM / 1K RPM) and are open on
+# the standard plan. Hence gpt-oss here rather than another Llama id.
+CHAT_MODEL = "openai/gpt-oss-120b"
 
 async def get_groq_response(messages: list):
     headers = {
