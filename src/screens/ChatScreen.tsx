@@ -326,8 +326,13 @@ const ChatScreen = () => {
     }
   }, []);
 
-  // Derive profileId and userId from session
+  // Derive profileId and userId from session. Skipped entirely in guest
+  // mode: a persisted Firebase session can outlive a deliberate switch to
+  // guest browsing, and without this guard both this effect and the guest
+  // one below would set profileId -- racing, and briefly pulling the real
+  // account's conversations into a guest session.
   useEffect(() => {
+    if (isGuestSession) return;
     if (session?.user && session.profileId) {
       setProfileId(session.profileId);
       setUserId(session.user.uid);

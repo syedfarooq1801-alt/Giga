@@ -38,9 +38,11 @@ export const SettingsScreen: React.FC = () => {
   const { colors, radius, typography, toggleTheme, isDark } = useTheme();
   const { signOut, user, userProfile } = useAuth();
   const { isGuest, exitGuestMode } = useGuest();
-  // A guest isn't "logged out mid-session" -- they never had an account.
-  // Either way the action is the same: get them to the auth screen.
-  const isSignedIn = !!user;
+  // Guest mode WINS over a Firebase user object. Signing in once leaves a
+  // persisted Firebase session in the browser, so `user` can still be
+  // truthy while someone is deliberately browsing as a guest -- keying
+  // this on !!user alone showed them "Logout" mid-guest-session.
+  const isSignedIn = !!user && !isGuest;
   const navigation = useNavigation<StackNavigationProp<RootStackParamList>>();
   const [feedback, setFeedback] = useState('');
   const [defaultPersonality, setDefaultPersonality] = useState<string>(DEFAULT_PERSONALITY_ID);
@@ -229,6 +231,10 @@ export const SettingsScreen: React.FC = () => {
     try {
       setIsLoading(true);
       await exitGuestMode({ keepData: true });
+      // Drop any stale Firebase session too, otherwise Navigation sees a
+      // lingering `user` and routes straight back into the app instead of
+      // showing the login screen the user just asked for.
+      if (user) await signOut();
     } catch (error) {
       console.error('Error leaving guest mode:', error);
     } finally {
