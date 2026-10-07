@@ -33,7 +33,13 @@ QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 COLLECTION_NAME = "documents"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-HF_EMBEDDING_URL = f"https://api-inference.huggingface.co/models/sentence-transformers/{EMBEDDING_MODEL_NAME}"
+# HuggingFace retired api-inference.huggingface.co in favour of the
+# Inference Providers router -- the old host no longer resolves in DNS at
+# all, so uploads failed before a request was even made, token or not.
+HF_EMBEDDING_URL = (
+    f"https://router.huggingface.co/hf-inference/models/sentence-transformers/{EMBEDDING_MODEL_NAME}"
+    "/pipeline/feature-extraction"
+)
 EMBEDDING_DIM = 384
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
@@ -70,9 +76,8 @@ async def _embed_texts(texts: List[str]) -> List[List[float]]:
     # finishes closing out).
     if not HF_API_TOKEN:
         raise RuntimeError("Document embeddings aren't configured (HF_API_TOKEN missing).")
-    # wait_for_model=True makes HF block server-side until a cold model is
-    # ready instead of returning a 503 -- simpler than a manual retry loop,
-    # at the cost of a longer timeout on a cold start.
+    # A cold model can 503 on the first call; the retry loop below covers
+    # that (the legacy wait_for_model option isn't part of the router API).
     last_error: Optional[Exception] = None
     for attempt in range(4):
         try:
@@ -80,7 +85,7 @@ async def _embed_texts(texts: List[str]) -> List[List[float]]:
                 resp = await client.post(
                     HF_EMBEDDING_URL,
                     headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
-                    json={"inputs": texts, "options": {"wait_for_model": True}},
+                    json={"inputs": texts},
                 )
             if resp.status_code != 200:
                 raise RuntimeError(f"Embedding request failed ({resp.status_code}): {resp.text[:200]}")

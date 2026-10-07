@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { API_URL } from '../constants';
-import { speechToText, startSpeechRecognition, stopSpeechRecognition, isRecognitionActive } from '../utils/speechRecognition';
+import { startSpeechRecognition, stopSpeechRecognition, isRecognitionActive } from '../utils/speechRecognition';
 import type { FC } from 'react';
 import { PERSONALITIES, DEFAULT_PERSONALITY_ID } from '../constants/personalities';
 import { useTheme } from '../contexts/ThemeContext';
@@ -487,8 +487,8 @@ const ChatScreen = () => {
   // images and voice all work. History for the backend is just what's
   // already on screen, since a guest conversation lives only in this
   // component's state + AsyncStorage.
-  const handleSendGuestMessage = async (text: string) => {
-    if (!guestId || (!text.trim() && !pendingImage)) return;
+  const handleSendGuestMessage = async (text: string): Promise<string | null> => {
+    if (!guestId || (!text.trim() && !pendingImage)) return null;
 
     const imageToSend = pendingImage;
     setPendingImage(null);
@@ -601,16 +601,21 @@ const ChatScreen = () => {
         return next;
       });
       void saveGuestMessages(updatedConversation.id, finalMessages);
+      return finalText;
     } catch (streamError) {
       console.error('Error streaming guest message:', streamError);
       setIsTyping(false);
       setMessages(prev => prev.filter(msg => msg.id !== streamId));
       Toast.show({ type: 'error', text1: 'Failed to send message', text2: 'Check your connection and try again.', position: 'bottom' });
+      return null;
     }
   };
 
-  const handleSendMessage = async (text: string) => {
-    if (!profileId || !userId || (!text.trim() && !pendingImage)) return;
+  // Returns the assistant's final reply text (or null), so callers that
+  // need it -- handleMicPress, which speaks the reply aloud -- can reuse
+  // this instead of duplicating the whole send flow.
+  const handleSendMessage = async (text: string): Promise<string | null> => {
+    if (!profileId || !userId || (!text.trim() && !pendingImage)) return null;
     if (isGuestSession) {
       return handleSendGuestMessage(text);
     }
@@ -711,6 +716,7 @@ const ChatScreen = () => {
           conversationId: convId,
         };
         let firstChunkReceived = false;
+        let streamedText: string | null = null;
 
         try {
           const streamResult = await sendMessageToBackendStream(
@@ -736,6 +742,7 @@ const ChatScreen = () => {
 
           if (streamResult) {
             const finalText = streamResult.fullText || 'Sorry, the AI could not generate a response.';
+            streamedText = finalText;
             const finalConvId = streamResult.conversationId || convId;
             setMessages(prev => {
               const withoutPlaceholder = prev.filter(msg => msg.id !== streamId);
@@ -773,7 +780,7 @@ const ChatScreen = () => {
           Toast.show({ type: 'error', text1: 'Failed to send message', text2: 'Check your connection and try again.', position: 'bottom' });
         }
 
-        return;
+        return streamedText;
       }
 
       const backendResult = await sendMessageToBackendAndGetResponse(
@@ -841,6 +848,7 @@ const ChatScreen = () => {
 
         // Stop the typing indicator as soon as we've processed the AI message
         setIsTyping(false);
+        return aiMessage.text;
       }
     } catch (error) {
       console.error('Error sending message:', error);
@@ -852,6 +860,7 @@ const ChatScreen = () => {
       // Show error to user
       Toast.show({ type: 'error', text1: 'Failed to send message', text2: 'Check your connection and try again.', position: 'bottom' });
     }
+    return null;
   };
 
   // Regenerate/reactions only make sense on the most recent assistant reply.
@@ -1450,116 +1459,69 @@ const ChatScreen = () => {
   }, [currentAudio]);
 
   // Handle microphone/stop button press
+  // Speaks a reply aloud. Split out of handleMicPress so the send itself
+  // can go through handleSendMessage rather than being reimplemented here.
+  const speakReply = (responseText: string) => {
+    const startTts = async () => {
+      try {
+        const cleanText = responseText
+          .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
+          .replace(/\.{3,}/g, '.')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (!cleanText) return;
+        stopTtsPlayback();
+
+        const MAX_CHUNK_LENGTH = 200;
+        for (let i = 0; i < cleanText.length; i += MAX_CHUNK_LENGTH) {
+          const chunk = cleanText.substring(i, i + MAX_CHUNK_LENGTH);
+          if (chunk.trim()) {
+            await playTtsChunk(chunk);
+          }
+        }
+      } catch (ttsError) {
+        console.error('Error with TTS service:', ttsError);
+        fallbackTts(responseText);
+      }
+    };
+    startTts();
+  };
+
   const handleMicPress = async () => {
     // If TTS is playing, stop it and return
     if (isTtsPlaying) {
       stopTtsPlayback();
       return;
     }
-    if (isLoadingMessages || !profileId || !currentConversation?.id) return;
+    // Deliberately NOT gated on currentConversation existing -- handleSendMessage
+    // lazily creates one, and requiring it here meant the mic silently did
+    // nothing on a fresh account/guest with no conversation yet.
+    if (isLoadingMessages || !profileId) return;
 
-    const isActive = isRecognitionActive();
-
-    if (isActive) {
-      // Stop recording and process the speech. inputText is deliberately
-      // left untouched here (see the start branch below for why) -- the
-      // transcript goes straight to sendMessageToBackendAndGetResponse,
-      // never through inputText/handleSendMessage.
+    if (isRecognitionActive()) {
       setIsListening(false);
       setIsTranscribing(true);
-      setIsTyping(true);
 
+      let transcript = '';
       try {
-        const transcript = await stopSpeechRecognition();
-
-        if (!transcript || !transcript.trim()) {
-          return;
-        }
-
-        // Create user message immediately for instant feedback
-        const userMessage: ChatMessage = {
-          id: `temp-${Date.now()}`,
-          text: transcript,
-          sender: 'user',
-          timestamp: new Date(),
-          conversationId: currentConversation?.id || '',
-          userId: getAuth().currentUser?.uid || 'unknown',
-          personalityId: selectedPersonality.id,
-          profileId: profileId || ''
-        };
-
-        // Add user message to the conversation immediately
-        setMessages(prev => [...prev, userMessage]);
-
-        // Send to backend and get AI response
-        const userId = getAuth().currentUser?.uid;
-        if (!userId || !currentConversation?.id) {
-          throw new Error('User not authenticated or no active conversation');
-        }
-
-        const response = await sendMessageToBackendAndGetResponse(
-          transcript,
-          selectedPersonality.id, // Use the ID of the selected personality
-          profileId,
-          currentConversation.id,
-          userId,
-          useDocuments
-        );
-
-        if (!response) {
-          throw new Error('No response from server');
-        }
-
-        // Add the message to the conversation
-        const { message: aiMessage } = response;
-
-        // Update UI with the AI message first for immediate feedback
-        setMessages(prev => [...prev, aiMessage]);
-
-        // Start TTS in parallel
-        const responseText = aiMessage.text;
-        if (responseText) {
-          const startTts = async () => {
-            try {
-              // Clean up the text for TTS
-              const cleanText = responseText
-                .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
-                .replace(/\.{3,}/g, '.')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-              if (!cleanText) {
-                console.log('No text to speak after cleaning');
-                return;
-              }
-              
-              console.log('TTS - Cleaned text:', cleanText);
-              stopTtsPlayback();
-              
-              // Split text into chunks if it's too long (200 chars per chunk)
-              const MAX_CHUNK_LENGTH = 200;
-              for (let i = 0; i < cleanText.length; i += MAX_CHUNK_LENGTH) {
-                const chunk = cleanText.substring(i, i + MAX_CHUNK_LENGTH);
-                if (chunk.trim()) {
-                  await playTtsChunk(chunk);
-                }
-              }
-            } catch (ttsError) {
-              console.error('Error with TTS service:', ttsError);
-              fallbackTts(responseText);
-            }
-          };
-          
-          // Start TTS without awaiting it
-          startTts();
-        }
+        transcript = (await stopSpeechRecognition()) || '';
       } catch (error) {
-        console.error('Error in speech recognition or message processing:', error);
+        console.error('Error stopping speech recognition:', error);
         alert('Failed to process speech. Please try again.');
-      } finally {
-        setIsTyping(false);
         setIsTranscribing(false);
+        return;
       }
+      setIsTranscribing(false);
+      if (!transcript.trim()) return;
+
+      // Hand off to the normal send path. That one already routes guest
+      // vs signed-in correctly, creates the conversation if needed, and
+      // persists the turn -- this used to duplicate all of it against the
+      // authenticated-only API, which is why voice failed outright for
+      // guests ("User not authenticated" -> "Failed to process speech").
+      const reply = await handleSendMessage(transcript);
+      if (reply) speakReply(reply);
     } else {
       // Start recording -- inputText is left alone (not hijacked with a
       // placeholder string) so whatever the user already typed survives;
