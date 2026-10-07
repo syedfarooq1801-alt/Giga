@@ -13,6 +13,7 @@ const GUEST_MODE_KEY = 'guestMode';
 const GUEST_ID_KEY = 'guestId';
 const GUEST_CONVERSATIONS_KEY = 'guestConversations';
 const GUEST_MESSAGES_PREFIX = 'guestMessages_';
+const GUEST_DOCUMENTS_KEY = 'guestDocuments';
 
 export async function isGuestModeEnabled(): Promise<boolean> {
   return (await AsyncStorage.getItem(GUEST_MODE_KEY)) === 'true';
@@ -86,6 +87,40 @@ export async function deleteGuestConversation(conversationId: string): Promise<v
   }
 }
 
+export type GuestDocument = { doc_id: string; filename: string; chunk_count: number };
+
+/** Document VECTORS live in Qdrant for guests exactly as they do for
+ * signed-in users (partitioned by the guest id). Only the "which files
+ * have I uploaded" list differs: signed-in users get a Firestore mirror,
+ * guests keep it here, since they have no Firestore presence at all. */
+export async function getGuestDocuments(): Promise<GuestDocument[]> {
+  try {
+    const raw = await AsyncStorage.getItem(GUEST_DOCUMENTS_KEY);
+    return raw ? (JSON.parse(raw) as GuestDocument[]) : [];
+  } catch (e) {
+    console.warn('[guestSession] Failed to read guest documents:', e);
+    return [];
+  }
+}
+
+export async function saveGuestDocuments(docs: GuestDocument[]): Promise<void> {
+  try {
+    await AsyncStorage.setItem(GUEST_DOCUMENTS_KEY, JSON.stringify(docs));
+  } catch (e) {
+    console.warn('[guestSession] Failed to save guest documents:', e);
+  }
+}
+
+export async function addGuestDocument(doc: GuestDocument): Promise<void> {
+  const docs = await getGuestDocuments();
+  await saveGuestDocuments([...docs.filter(d => d.doc_id !== doc.doc_id), doc]);
+}
+
+export async function removeGuestDocument(docId: string): Promise<void> {
+  const docs = await getGuestDocuments();
+  await saveGuestDocuments(docs.filter(d => d.doc_id !== docId));
+}
+
 /** Everything a guest built up, in the shape /api/guest/migrate expects. */
 export async function collectGuestDataForMigration(): Promise<{
   conversations: { title: string; personality: string; messages: { text: string; sender: string }[] }[];
@@ -112,6 +147,7 @@ export async function clearGuestData(): Promise<void> {
     GUEST_MODE_KEY,
     GUEST_ID_KEY,
     GUEST_CONVERSATIONS_KEY,
+    GUEST_DOCUMENTS_KEY,
     ...conversations.map(c => GUEST_MESSAGES_PREFIX + c.id),
   ];
   try {

@@ -301,6 +301,26 @@ async def create_share_token(chat_id: str, owner_uid: str, profile_id: str) -> s
     return token
 
 
+async def create_guest_share_snapshot(messages: List[Dict[str, Any]], title: str, personality: str) -> str:
+    """Share-link variant for guests, who have no Firestore chat doc to
+    reference. Stores a denormalized SNAPSHOT of the conversation instead:
+    the trade is that it can't reflect later edits and can't be revoked by
+    deleting a source chat (there isn't one), but it's the only way to
+    share something that otherwise exists purely in one browser's storage.
+    Written via the Admin SDK, same as create_share_token -- the security
+    rules deny all client writes to this collection."""
+    token = secrets.token_urlsafe(16)
+    db.collection('shared_conversations').document(token).set({
+        'kind': 'snapshot',
+        'messages': messages,
+        'title': title,
+        'personality': personality,
+        'created_at': firestore.SERVER_TIMESTAMP,
+        'revoked': False,
+    })
+    return token
+
+
 async def get_share(token: str) -> Optional[Dict[str, Any]]:
     """Look up a share token's reference doc, or None if it doesn't exist."""
     doc = db.collection('shared_conversations').document(token).get()

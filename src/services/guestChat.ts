@@ -1,4 +1,5 @@
 import { API_URL } from '../constants';
+import { getOrCreateGuestId } from './guestSession';
 
 type StreamResult = { fullText: string } | null;
 
@@ -14,15 +15,22 @@ export async function sendGuestMessageStream(
   text: string,
   personalityId: string,
   history: { role: 'user' | 'assistant'; content: string }[],
-  onChunk: (chunk: string) => void
+  onChunk: (chunk: string) => void,
+  useDocuments = false
 ): Promise<StreamResult> {
   const response = await fetch(`${API_URL}/api/guest/chat/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      // Needed only when RAG is on -- the backend partitions Qdrant by
+      // this id to find the guest's own uploaded documents.
+      'X-Guest-Id': await getOrCreateGuestId(),
+    },
     body: JSON.stringify({
       message: text,
       personality: personalityId,
       history,
+      use_documents: useDocuments,
     }),
   });
 
@@ -60,6 +68,51 @@ export async function sendGuestMessageStream(
   }
 
   return { fullText: fullText.trim() };
+}
+
+/** Guest counterpart to the signed-in image turn. Vision is one-shot and
+ * non-streaming on both sides (there's no streaming vision endpoint), so
+ * this returns the whole reply at once. */
+export async function sendGuestImageMessage(
+  text: string,
+  personalityId: string,
+  imageDataUrl: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_URL}/api/guest/chat/vision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, personality: personalityId, image: imageDataUrl }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.message || null;
+  } catch (e) {
+    console.warn('[guestChat] Vision request failed:', e);
+    return null;
+  }
+}
+
+/** Guest share uploads a snapshot of the conversation, since there's no
+ * server-side chat doc for a share token to point at. */
+export async function shareGuestConversation(
+  title: string,
+  personalityId: string,
+  messages: { text: string; sender: string }[]
+): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_URL}/api/guest/share`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, personality: personalityId, messages }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.url || null;
+  } catch (e) {
+    console.warn('[guestChat] Share request failed:', e);
+    return null;
+  }
 }
 
 /** Uploads everything a guest built up so far into the now-real signed-in

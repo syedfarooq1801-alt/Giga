@@ -41,7 +41,7 @@ const EmailAuthScreen = () => {
   const scrollViewRef = useRef<any>(null);
 
   const { signInWithEmail, signUpWithEmail, sendPasswordResetEmail } = useAuth();
-  const { isGuest, enterGuestMode, exitGuestMode } = useGuest();
+  const { enterGuestMode, exitGuestMode } = useGuest();
   const [guestLoading, setGuestLoading] = useState(false);
   const { colors, radius, typography } = useTheme();
   const styles = makeStyles(colors, radius, typography);
@@ -86,7 +86,10 @@ const EmailAuthScreen = () => {
   // guest data in place rather than losing it, so it can be retried on
   // the next login instead of silently vanishing.
   const migrateGuestDataIfAny = async () => {
-    if (!isGuest) return;
+    // Deliberately keyed on whether guest DATA exists, not on isGuest:
+    // Settings' "Log in" button leaves guest mode while keeping the
+    // chats, so by the time we get here isGuest is already false and
+    // checking it would silently skip the migration.
     try {
       const payload = await collectGuestDataForMigration();
       if (payload.conversations.length === 0) {
@@ -385,7 +388,7 @@ const EmailAuthScreen = () => {
             )}
           </TouchableOpacity>
           <Text style={styles.guestHint}>
-            Basic chat only, stored on this device. Sign in anytime to save it to your account.
+            Full access, saved on this device only. Sign in anytime to sync it to your account.
           </Text>
         </View>
       </ScrollView>

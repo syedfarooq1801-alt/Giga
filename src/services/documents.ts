@@ -3,6 +3,28 @@ import * as DocumentPicker from 'expo-document-picker';
 import { getAuth } from 'firebase/auth';
 import Toast from 'react-native-toast-message';
 import { API_URL } from '../constants';
+import {
+  isGuestModeEnabled,
+  getOrCreateGuestId,
+  getGuestDocuments,
+  addGuestDocument,
+  removeGuestDocument,
+} from './guestSession';
+
+/**
+ * Documents work identically signed-in or as a guest -- the vectors go to
+ * the same Qdrant collection either way, partitioned by whichever id the
+ * backend resolves. The only difference is which identity header goes up:
+ * a Firebase bearer token, or X-Guest-Id. The backend's
+ * get_current_user_or_guest dependency accepts either.
+ */
+async function authHeaders(): Promise<Record<string, string>> {
+  if (await isGuestModeEnabled()) {
+    return { 'X-Guest-Id': await getOrCreateGuestId() };
+  }
+  const idToken = await getAuth().currentUser?.getIdToken();
+  return { Authorization: `Bearer ${idToken}` };
+}
 
 export type UploadedDocument = { doc_id: string; filename: string; chunk_count: number };
 export type DocumentMeta = { doc_id: string; filename: string; chunk_count: number };
@@ -39,14 +61,19 @@ export async function pickAndUploadDocument(): Promise<UploadedDocument | null> 
       } as any);
     }
 
-    const idToken = await getAuth().currentUser?.getIdToken();
     const res = await fetch(`${API_URL}/api/documents/upload`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${idToken}` },
+      headers: await authHeaders(),
       body: form,
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Upload failed');
+
+    // Guests have no Firestore metadata mirror, so the "my documents"
+    // list is kept locally instead (the backend returns [] for them).
+    if (await isGuestModeEnabled()) {
+      await addGuestDocument({ doc_id: data.doc_id, filename: data.filename, chunk_count: data.chunk_count });
+    }
 
     Toast.show({
       type: 'success',
@@ -68,9 +95,9 @@ export async function pickAndUploadDocument(): Promise<UploadedDocument | null> 
 
 export async function fetchDocumentsList(): Promise<DocumentMeta[]> {
   try {
-    const idToken = await getAuth().currentUser?.getIdToken();
+    if (await isGuestModeEnabled()) return await getGuestDocuments();
     const res = await fetch(`${API_URL}/api/documents`, {
-      headers: { Authorization: `Bearer ${idToken}` },
+      headers: await authHeaders(),
     });
     const data = await res.json();
     return data.documents || [];
@@ -81,11 +108,11 @@ export async function fetchDocumentsList(): Promise<DocumentMeta[]> {
 
 export async function deleteDocumentById(docId: string): Promise<boolean> {
   try {
-    const idToken = await getAuth().currentUser?.getIdToken();
     const res = await fetch(`${API_URL}/api/documents/${docId}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${idToken}` },
+      headers: await authHeaders(),
     });
+    if (res.ok && (await isGuestModeEnabled())) await removeGuestDocument(docId);
     return res.ok;
   } catch {
     return false;

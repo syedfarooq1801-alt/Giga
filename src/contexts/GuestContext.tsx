@@ -15,10 +15,11 @@ interface GuestContextType {
    * screen for one frame before this resolves. */
   loading: boolean;
   enterGuestMode: () => Promise<void>;
-  /** Called once a guest's local chats have been migrated into a real
-   * account (or the user explicitly discards them) -- clears the guest
-   * flag/id and all local conversation data. */
-  exitGuestMode: () => Promise<void>;
+  /** Leaves guest mode. By default (after a successful migration into a
+   * real account) it also wipes the local guest data; pass
+   * { keepData: true } when the user is just heading to the login screen,
+   * so backing out doesn't destroy chats they haven't migrated yet. */
+  exitGuestMode: (options?: { keepData?: boolean }) => Promise<void>;
 }
 
 const GuestContext = createContext<GuestContextType | undefined>(undefined);
@@ -55,9 +56,16 @@ export const GuestProvider: FC<{ children: ReactNode }> = ({ children }) => {
     setIsGuest(true);
   }, []);
 
-  const exitGuestMode = useCallback(async () => {
-    await clearGuestData();
-    setGuestId(null);
+  const exitGuestMode = useCallback(async (options?: { keepData?: boolean }) => {
+    if (options?.keepData) {
+      // Only drop the "I'm in guest mode" flag -- the id and the stored
+      // conversations stay, so signing in can still migrate them (and
+      // coming back to guest mode finds them intact).
+      await setGuestModeEnabled(false);
+    } else {
+      await clearGuestData();
+      setGuestId(null);
+    }
     setIsGuest(false);
   }, []);
 

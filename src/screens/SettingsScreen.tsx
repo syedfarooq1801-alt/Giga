@@ -14,6 +14,7 @@ import {
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { pickAndUploadDocument, fetchDocumentsList, deleteDocumentById } from '../services/documents';
+import { useGuest } from '../contexts/GuestContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../contexts/ThemeContext';
 import { useNavigation } from '@react-navigation/native';
@@ -36,6 +37,10 @@ export const SettingsScreen: React.FC = () => {
 
   const { colors, radius, typography, toggleTheme, isDark } = useTheme();
   const { signOut, user, userProfile } = useAuth();
+  const { isGuest, exitGuestMode } = useGuest();
+  // A guest isn't "logged out mid-session" -- they never had an account.
+  // Either way the action is the same: get them to the auth screen.
+  const isSignedIn = !!user;
   const navigation = useNavigation<StackNavigationProp<RootStackParamList>>();
   const [feedback, setFeedback] = useState('');
   const [defaultPersonality, setDefaultPersonality] = useState<string>(DEFAULT_PERSONALITY_ID);
@@ -216,6 +221,21 @@ export const SettingsScreen: React.FC = () => {
     saveSettings({ saveChats: next });
   };
 
+  // Leaving guest mode drops the guest flag so Navigation falls back to
+  // the Auth screen. Deliberately does NOT clear local guest chats --
+  // signing in migrates them, and discarding them here would silently
+  // destroy the user's history just because they tapped "Log in".
+  const handleGoToLogin = async () => {
+    try {
+      setIsLoading(true);
+      await exitGuestMode({ keepData: true });
+    } catch (error) {
+      console.error('Error leaving guest mode:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const handleLogout = async () => {
     try {
       setIsLoading(true);
@@ -339,10 +359,13 @@ export const SettingsScreen: React.FC = () => {
           <Text style={styles.aboutButtonText}>Documents</Text>
         </TouchableOpacity>
 
-        {/* Prompt Experiments Button */}
-        <TouchableOpacity style={styles.aboutButton} onPress={() => setShowExperiments(true)}>
-          <Text style={styles.aboutButtonText}>Prompt Experiments</Text>
-        </TouchableOpacity>
+        {/* Prompt Experiments reads per-account reaction data, so it's
+            genuinely account-only -- hidden rather than shown broken. */}
+        {isSignedIn && (
+          <TouchableOpacity style={styles.aboutButton} onPress={() => setShowExperiments(true)}>
+            <Text style={styles.aboutButtonText}>Prompt Experiments</Text>
+          </TouchableOpacity>
+        )}
 
         {/* About Button */}
         <TouchableOpacity style={styles.aboutButton} onPress={() => setShowAbout(true)}>
@@ -354,10 +377,18 @@ export const SettingsScreen: React.FC = () => {
           <Text style={styles.termsButtonText}>Terms &amp; Conditions</Text>
         </TouchableOpacity>
 
-        {/* Logout Button */}
-        <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
-          <Text style={styles.logoutButtonText}>Logout</Text>
+        {/* Log out when signed in; log IN when browsing as a guest. */}
+        <TouchableOpacity
+          style={styles.logoutButton}
+          onPress={isSignedIn ? handleLogout : handleGoToLogin}
+        >
+          <Text style={styles.logoutButtonText}>{isSignedIn ? 'Logout' : 'Log in'}</Text>
         </TouchableOpacity>
+        {!isSignedIn && (
+          <Text style={styles.guestNote}>
+            You're browsing as a guest. Chats are saved on this device only — log in to sync them to your account.
+          </Text>
+        )}
 
         {/* Terms & Conditions Modal */}
         <Modal visible={showTerms} animationType="slide" onRequestClose={() => setShowTerms(false)}>
@@ -652,6 +683,14 @@ const makeStyles = (colors: any, radius: any, typography: any) =>
       marginBottom: 24,
     },
     logoutButtonText: { color: '#ffffff', fontWeight: typography.weight.bold, fontSize: typography.size.base },
+    guestNote: {
+      color: colors.sub,
+      fontSize: 12,
+      textAlign: 'center',
+      paddingHorizontal: 24,
+      paddingTop: 10,
+      paddingBottom: 4,
+    },
     modalContainer: { flex: 1, backgroundColor: colors.paper },
     modalHeader: {
       flexDirection: 'row',

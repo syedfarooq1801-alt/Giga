@@ -32,7 +32,7 @@ import {
   getGuestMessages,
   saveGuestMessages,
 } from '../services/guestSession';
-import { sendGuestMessageStream } from '../services/guestChat';
+import { sendGuestMessageStream, sendGuestImageMessage, shareGuestConversation } from '../services/guestChat';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MaterialCommunityIcons, MaterialIcons as Icon } from '@expo/vector-icons';
 import { MessageBubble } from '../components/MessageBubble';
@@ -476,13 +476,17 @@ const ChatScreen = () => {
 
   // Guest mode's send flow -- deliberately kept separate from the
   // authenticated one below rather than threading isGuestSession branches
-  // through it: guest chat is simpler (no Firestore, no messageDocId, no
-  // image/RAG turns, streaming-only) and this way the existing,
-  // well-exercised authenticated path is untouched. History for the
-  // backend is just what's already on screen, since a guest conversation
-  // lives only in this component's state + AsyncStorage.
+  // through it: guests have no Firestore, so no messageDocId round-trip
+  // and no server-side history, and this way the existing, well-exercised
+  // authenticated path is untouched. Feature-wise it now matches: RAG,
+  // images and voice all work. History for the backend is just what's
+  // already on screen, since a guest conversation lives only in this
+  // component's state + AsyncStorage.
   const handleSendGuestMessage = async (text: string) => {
-    if (!guestId || !text.trim()) return;
+    if (!guestId || (!text.trim() && !pendingImage)) return;
+
+    const imageToSend = pendingImage;
+    setPendingImage(null);
 
     const isFirstMessageInConversation = messages.length === 0;
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -505,6 +509,7 @@ const ChatScreen = () => {
       profileId: guestId,
       conversationId: convId,
       isOptimistic: true,
+      imageUri: imageToSend?.dataUrl,
     };
     setMessages(prev => [...prev, tempUserMessage]);
     setInputText('');
@@ -525,22 +530,37 @@ const ChatScreen = () => {
     let firstChunkReceived = false;
 
     try {
-      const streamResult = await sendGuestMessageStream(
-        tempUserMessage.text,
-        selectedPersonality.id,
-        history,
-        (chunk) => {
-          if (!firstChunkReceived) {
-            firstChunkReceived = true;
-            setIsTyping(false);
-            setMessages(prev => [...prev, streamPlaceholder]);
-          }
-          setMessages(prev => prev.map(msg => (msg.id === streamId ? { ...msg, text: msg.text + chunk } : msg)));
-        }
-      );
+      let finalText: string;
+
+      if (imageToSend) {
+        // Vision is one-shot (no streaming vision endpoint), exactly like
+        // the signed-in path -- wait for the whole reply, no placeholder
+        // chunk updates.
+        const visionReply = await sendGuestImageMessage(
+          tempUserMessage.text || '[Image]',
+          selectedPersonality.id,
+          imageToSend.dataUrl
+        );
+        finalText = visionReply || 'Sorry, the AI could not generate a response.';
+      } else {
+        const streamResult = await sendGuestMessageStream(
+          tempUserMessage.text,
+          selectedPersonality.id,
+          history,
+          (chunk) => {
+            if (!firstChunkReceived) {
+              firstChunkReceived = true;
+              setIsTyping(false);
+              setMessages(prev => [...prev, streamPlaceholder]);
+            }
+            setMessages(prev => prev.map(msg => (msg.id === streamId ? { ...msg, text: msg.text + chunk } : msg)));
+          },
+          useDocuments
+        );
+        finalText = streamResult?.fullText || 'Sorry, the AI could not generate a response.';
+      }
 
       setIsTyping(false);
-      const finalText = streamResult?.fullText || 'Sorry, the AI could not generate a response.';
 
       // Computed directly rather than read back out of a setMessages
       // updater -- React doesn't guarantee that updater runs synchronously,
@@ -907,16 +927,35 @@ const ChatScreen = () => {
   const handleShare = async () => {
     if (!currentConversation?.id) return;
     try {
-      const idToken = await getAuth().currentUser?.getIdToken();
-      const res = await fetch(`${API_URL}/api/conversations/${currentConversation.id}/share`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${idToken}` },
-      });
-      if (!res.ok) throw new Error(`Backend error: ${res.status}`);
-      const data = await res.json();
+      // Signed-in shares store a REFERENCE to the Firestore chat doc;
+      // guests have no such doc, so theirs uploads a snapshot of the
+      // messages instead. Both mint the same kind of /shared/<token> URL.
+      let shareUrl: string | null;
+      if (isGuestSession) {
+        if (messages.length === 0) {
+          Toast.show({ type: 'error', text1: 'Nothing to share yet', position: 'bottom' });
+          return;
+        }
+        shareUrl = await shareGuestConversation(
+          currentConversation.title,
+          selectedPersonality.id,
+          messages.map(m => ({ text: m.text, sender: m.sender }))
+        );
+        if (!shareUrl) throw new Error('Guest share failed');
+      } else {
+        const idToken = await getAuth().currentUser?.getIdToken();
+        const res = await fetch(`${API_URL}/api/conversations/${currentConversation.id}/share`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${idToken}` },
+        });
+        if (!res.ok) throw new Error(`Backend error: ${res.status}`);
+        shareUrl = (await res.json()).url;
+      }
+
+      if (!shareUrl) throw new Error('No share URL returned');
       const fullUrl = Platform.OS === 'web' && typeof window !== 'undefined'
-        ? `${window.location.origin}${data.url}`
-        : data.url;
+        ? `${window.location.origin}${shareUrl}`
+        : shareUrl;
 
       let copied = false;
       if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
@@ -1924,7 +1963,7 @@ const ChatScreen = () => {
         selectedPersonality={selectedPersonality}
         onSelectPersonality={handlePersonalitySelect}
         isDefaultPersonality={selectedPersonality.id === DEFAULT_PERSONALITY_ID}
-        onShare={!isGuestSession && currentConversation?.id ? handleShare : undefined}
+        onShare={currentConversation?.id ? handleShare : undefined}
         hideMenuButton={isWideScreen}
       />
       {!isOnline && (
@@ -1994,10 +2033,7 @@ const ChatScreen = () => {
         </View>
       )}
       <View style={styles.inputContainer}>
-        {/* Guest mode is basic chat only -- no RAG/uploads (needs a real
-            account for Qdrant/Firestore-backed document storage). */}
-        {!isGuestSession && (
-          <View>
+        <View>
             {showAttachMenu && (
               <>
                 <TouchableOpacity
@@ -2042,9 +2078,8 @@ const ChatScreen = () => {
               ) : (
                 <MaterialCommunityIcons name="paperclip" size={18} color={useDocuments ? colors.accentContrast : colors.sub} />
               )}
-            </TouchableOpacity>
-          </View>
-        )}
+          </TouchableOpacity>
+        </View>
         <View>
           {showEmojiMenu && (
             <>
@@ -2114,31 +2149,28 @@ const ChatScreen = () => {
             }
           }}
         />
-        {/* Voice is excluded from guest mode's basic-chat scope. */}
-        {!isGuestSession && (
-          <TouchableOpacity
-            style={[
-              styles.micButton,
-              isListening && styles.micButtonActive,
-              (isTyping || isTtsPlaying) && styles.micButtonDisabled,
-              isTtsPlaying && styles.stopButton,
-            ]}
-            onPress={handleMicPress}
-            disabled={isTyping}
-          >
-            {isTtsPlaying ? (
-              <View style={styles.stopIcon}>
-                <View style={styles.stopIconInner} />
-              </View>
-            ) : (
-              <Icon
-                name={isListening ? 'stop' : 'mic'}
-                size={20}
-                color={isTyping ? colors.sub : isListening ? colors.accentContrast : colors.ink}
-              />
-            )}
-          </TouchableOpacity>
-        )}
+        <TouchableOpacity
+          style={[
+            styles.micButton,
+            isListening && styles.micButtonActive,
+            (isTyping || isTtsPlaying) && styles.micButtonDisabled,
+            isTtsPlaying && styles.stopButton,
+          ]}
+          onPress={handleMicPress}
+          disabled={isTyping}
+        >
+          {isTtsPlaying ? (
+            <View style={styles.stopIcon}>
+              <View style={styles.stopIconInner} />
+            </View>
+          ) : (
+            <Icon
+              name={isListening ? 'stop' : 'mic'}
+              size={20}
+              color={isTyping ? colors.sub : isListening ? colors.accentContrast : colors.ink}
+            />
+          )}
+        </TouchableOpacity>
         <TouchableOpacity
           style={[
             styles.sendButton,

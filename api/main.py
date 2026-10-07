@@ -26,6 +26,7 @@ from firebase_memory_manager import (
     add_document_metadata,
     list_documents,
     delete_document_metadata,
+    create_guest_share_snapshot,
 )
 from rag import upload_document, delete_document_vectors, search_context
 from local_llm import generate_finetuned_response
@@ -272,6 +273,47 @@ async def get_current_user(request: Request) -> Dict[str, Any]:
             status_code=401,
             detail=f"Authentication failed: {str(e)}"
         )
+
+# Guest ids are minted client-side (src/services/guestSession.ts) as
+# "guest_<uuid4>". The shape check below is the one security property that
+# actually matters here: a real profile_id is always "{uid}_{providerId}",
+# so a guest can never craft an id that collides with a signed-in user's
+# Qdrant partition or Firestore path. Beyond that, guest-vs-guest
+# isolation is best-effort by design -- the id is just a client-supplied
+# header, so a determined guest could claim another guest's id. That's an
+# accepted tradeoff for anonymous, device-local data; nothing of value
+# sits behind it, and anything that does requires a real account.
+GUEST_ID_RE = re.compile(r"^guest_[0-9a-fA-F-]{36}$")
+
+
+def _resolve_guest(request: Request) -> Optional[Dict[str, Any]]:
+    guest_id = request.headers.get("X-Guest-Id")
+    if guest_id and GUEST_ID_RE.match(guest_id):
+        return {"uid": guest_id, "profile_id": guest_id, "is_guest": True}
+    return None
+
+
+async def get_current_user_or_guest(request: Request) -> Dict[str, Any]:
+    """Auth dependency for endpoints that work signed-in OR as a guest.
+
+    Prefers a real Firebase session when an Authorization header is
+    present; otherwise falls back to an X-Guest-Id header. Returning the
+    same {uid, profile_id} shape either way is what lets the endpoints
+    below stay mostly identity-agnostic -- they branch on is_guest only
+    where Firestore is involved, since guests have no Firestore presence
+    at all (their chats and document metadata live in browser storage).
+    """
+    if request.headers.get("Authorization"):
+        return await get_current_user(request)
+    guest = _resolve_guest(request)
+    if guest:
+        return guest
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authorization header or X-Guest-Id required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
 
 # Cache for frequently asked questions
 @lru_cache(maxsize=100000)
@@ -1197,14 +1239,25 @@ async def chat(
 GUEST_HISTORY_LIMIT = 20  # how much client-supplied history we forward to the LLM
 
 
-def _build_guest_messages(message: str, personality: str, history: list) -> list:
+def _build_guest_messages(message: str, personality: str, history: list, rag_chunks: Optional[list] = None) -> list:
     """Guest-mode equivalent of _build_chat_messages -- no Firestore, no A/B
-    variant, no RAG. History comes entirely from the client (guest
-    conversations only ever live in browser storage, see
-    src/services/guestChat.ts), so it's capped and sanity-checked here
-    since it's unauthenticated, client-controlled input."""
+    variant. History comes entirely from the client (guest conversations
+    only ever live in browser storage, see src/services/guestChat.ts), so
+    it's capped and sanity-checked here since it's unauthenticated,
+    client-controlled input. RAG chunks are fetched by the caller (it
+    needs the guest id, which this function doesn't take) and injected
+    the same way _build_chat_messages does it."""
     personality_context = get_personality_context(personality)
     messages = []
+
+    if rag_chunks:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Relevant context from the user's uploaded documents (use it if helpful, "
+                "ignore it if not relevant to their message):\n\n" + "\n---\n".join(rag_chunks)
+            ),
+        })
     if personality_context and isinstance(personality_context, list):
         for msg in personality_context:
             if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
@@ -1269,9 +1322,11 @@ async def _stream_groq_sentences(messages: list, user_message: str, personality:
 @api_app.options("/guest/chat/stream", include_in_schema=False)
 @limiter.limit("10/minute")
 async def guest_chat_stream(request: Request, origin: str = Header(None, include_in_schema=False)):
-    """Unauthenticated counterpart to /chat/stream for guest mode -- basic
-    text chat only (no RAG, vision, voice, fine-tuned model, or Firestore
-    reads/writes of any kind). The client supplies its own recent message
+    """Unauthenticated counterpart to /chat/stream for guest mode. Does
+    everything the signed-in endpoint does except touch Firestore: RAG
+    against the guest's own uploaded documents works (Qdrant partitions
+    on the guest id), the fine-tuned model path doesn't (it's unset in
+    prod for everyone). The client supplies its own recent message
     history since guest conversations live entirely in browser storage,
     not in a Firestore chat doc the server could fetch. Rate limited
     tighter than the authenticated endpoint (10/min vs 20/min) since this
@@ -1293,16 +1348,23 @@ async def guest_chat_stream(request: Request, origin: str = Header(None, include
     message = data.get("message")
     personality = data.get("personality", "swag")
     history = data.get("history", [])
+    use_documents = bool(data.get("use_documents", False))
+    guest = _resolve_guest(request)
 
     if not message or not isinstance(message, str):
         return JSONResponse(content={"message": "Message is required"}, status_code=400, headers=cors_headers)
     if len(message) > 4000:
         return JSONResponse(content={"message": "Message is too long"}, status_code=400, headers=cors_headers)
 
-    logger.info(f"Guest stream chat request - Personality: {personality}")
+    logger.info(f"Guest stream chat request - Personality: {personality}, docs: {use_documents}")
 
     async def event_generator():
-        messages = _build_guest_messages(message, personality, history)
+        rag_chunks = []
+        if use_documents and guest:
+            # search_context never raises -- an empty list just means no
+            # augmentation, same contract as the signed-in path.
+            rag_chunks = await search_context(guest["profile_id"], message)
+        messages = _build_guest_messages(message, personality, history, rag_chunks)
         result: Dict[str, Any] = {}
         async for line in _stream_groq_sentences(messages, message, personality, result):
             yield line
@@ -1312,6 +1374,80 @@ async def guest_chat_stream(request: Request, origin: str = Header(None, include
         event_generator(),
         media_type="text/event-stream",
         headers={**cors_headers, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class GuestShareMessage(BaseModel):
+    text: str
+    sender: str  # 'user' | 'assistant'
+
+
+class GuestShareRequest(BaseModel):
+    title: Optional[str] = None
+    personality: str = "swag"
+    messages: List[GuestShareMessage] = []
+
+
+@api_app.post("/guest/share")
+@limiter.limit("5/minute")
+async def guest_share_conversation(request: Request, body: GuestShareRequest):
+    """Share a guest conversation. Unlike the signed-in path (which stores
+    a reference to a Firestore chat doc), this uploads a snapshot of the
+    messages, since a guest conversation exists only in browser storage.
+    Capped hard -- this is the one place unauthenticated callers can put
+    arbitrary content into Firestore."""
+    if not body.messages:
+        raise HTTPException(status_code=400, detail="Nothing to share")
+    if len(body.messages) > 200:
+        raise HTTPException(status_code=400, detail="Conversation too long to share")
+
+    messages = [
+        {"text": m.text[:4000], "sender": "user" if m.sender == "user" else "assistant"}
+        for m in body.messages
+    ]
+    token = await create_guest_share_snapshot(messages, (body.title or "Shared chat")[:100], body.personality)
+    return {"success": True, "token": token, "url": f"/shared/{token}"}
+
+
+@api_app.post("/guest/chat/vision")
+@limiter.limit("5/minute")
+async def guest_chat_vision(request: Request, origin: str = Header(None, include_in_schema=False)):
+    """Guest counterpart to /chat's image branch. Vision is a one-shot Groq
+    call that deliberately skips conversation history and RAG on the
+    signed-in side too, so there's very little to share between them --
+    this stays a small standalone handler rather than threading is_guest
+    through the big /chat body. Tighter rate limit than text: image
+    payloads are far more expensive per call."""
+    cors_headers = {
+        "Access-Control-Allow-Origin": origin or "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+    data = await request.json()
+    message = data.get("message") or "[Image]"
+    personality = data.get("personality", "swag")
+    image_data_url = data.get("image")
+
+    if not image_data_url or not isinstance(image_data_url, str):
+        return JSONResponse(content={"message": "Image is required"}, status_code=400, headers=cors_headers)
+
+    try:
+        system_prompt = get_personality_context(personality)[0]["content"]
+        response = await get_groq_vision_response(system_prompt, message, image_data_url)
+        response = clean_llm_response(response)
+        response = str(response).strip() if response else "I'm not sure how to respond to that. Could you rephrase?"
+        response = remove_user_message_references(response, message)
+        persona_name = get_persona_name(personality)
+        if response.lower().startswith(persona_name.lower() + ":"):
+            response = response[len(persona_name) + 1:].strip()
+        response = remove_meta_references(response)
+    except Exception as e:
+        logger.error(f"Error generating guest vision response: {str(e)}")
+        response = "Hmm, let me think of a better response. Try asking me something else!"
+
+    return JSONResponse(
+        content={"message": response, "timestamp": datetime.now().isoformat(), "personality": personality},
+        headers=cors_headers,
     )
 
 
@@ -1729,6 +1865,10 @@ async def get_shared_conversation(token: str):
     share = await get_share(token)
     if not share or share.get('revoked'):
         raise HTTPException(status_code=404, detail="Share link not found or revoked")
+    # Guest shares are snapshots (no Firestore chat doc to dereference) --
+    # the messages are stored inline on the share doc itself.
+    if share.get('kind') == 'snapshot':
+        return {"success": True, "messages": share.get('messages', [])}
     turns = await get_chat_messages(
         chat_id=share['chat_id'], user_id=share['owner_uid'], profile_id=share.get('profile_id'), limit=200
     )
@@ -1741,7 +1881,10 @@ MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB -- generous for a personal-pr
 
 
 @api_app.post("/documents/upload")
-async def upload_document_endpoint(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def upload_document_endpoint(
+    request: Request, file: UploadFile = File(...), current_user: dict = Depends(get_current_user_or_guest)
+):
     """Chunk, embed, and store an uploaded document for RAG. Explicit user
     action -- unlike the RAG lookup during chat, failures here raise real
     errors instead of degrading silently, since the user needs to know if
@@ -1783,12 +1926,20 @@ async def upload_document_endpoint(file: UploadFile = File(...), current_user: d
         logger.error(f"Unexpected error during document upload: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Upload failed unexpectedly. Please try again.")
 
-    await add_document_metadata(profile_id, user_id, result["doc_id"], filename, result["chunk_count"])
+    # Vectors are in Qdrant either way (partitioned by effective_user_id,
+    # which is the guest id for guests). Only the metadata mirror differs:
+    # guests have no Firestore presence, so the client keeps their document
+    # list in browser storage instead (src/services/guestSession.ts).
+    if not current_user.get("is_guest"):
+        await add_document_metadata(profile_id, user_id, result["doc_id"], filename, result["chunk_count"])
     return {"success": True, "doc_id": result["doc_id"], "filename": filename, "chunk_count": result["chunk_count"]}
 
 
 @api_app.get("/documents")
-async def list_documents_endpoint(current_user: dict = Depends(get_current_user)):
+async def list_documents_endpoint(current_user: dict = Depends(get_current_user_or_guest)):
+    # Guests keep their own list client-side; there's nothing to read here.
+    if current_user.get("is_guest"):
+        return {"success": True, "documents": []}
     user_id = current_user.get("uid")
     profile_id = current_user.get("profile_id")
     docs = await list_documents(profile_id, user_id)
@@ -1796,14 +1947,17 @@ async def list_documents_endpoint(current_user: dict = Depends(get_current_user)
 
 
 @api_app.delete("/documents/{doc_id}")
-async def delete_document_endpoint(doc_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_document_endpoint(doc_id: str, current_user: dict = Depends(get_current_user_or_guest)):
     user_id = current_user.get("uid")
     profile_id = current_user.get("profile_id")
     effective_user_id = profile_id or user_id
 
-    deleted_metadata = await delete_document_metadata(profile_id, user_id, doc_id)
-    if not deleted_metadata:
-        raise HTTPException(status_code=404, detail="Document not found")
+    # For guests the metadata record lives client-side, so there's nothing
+    # to delete (or to 404 on) here -- go straight to the vectors.
+    if not current_user.get("is_guest"):
+        deleted_metadata = await delete_document_metadata(profile_id, user_id, doc_id)
+        if not deleted_metadata:
+            raise HTTPException(status_code=404, detail="Document not found")
 
     try:
         await delete_document_vectors(effective_user_id, doc_id)
