@@ -44,6 +44,7 @@ import Toast from 'react-native-toast-message';
 import { getAuth } from 'firebase/auth';
 import { getConversationTitleFromGroq } from '../utils/groqTitle';
 import { pickAndUploadDocument } from '../services/documents';
+import { resizeImageDataUrl } from '../utils/resizeImage';
 import * as ImagePicker from 'expo-image-picker';
 import { PersonalityType } from '../types/chat';
 import { Conversation } from '../types/Conversation';
@@ -476,7 +477,11 @@ const ChatScreen = () => {
       return;
     }
     const mimeType = asset.mimeType || 'image/jpeg';
-    setPendingImage({ dataUrl: `data:${mimeType};base64,${asset.base64}` });
+    try {
+      setPendingImage({ dataUrl: await resizeImageDataUrl(`data:${mimeType};base64,${asset.base64}`) });
+    } catch {
+      Toast.show({ type: 'error', text1: 'Could not read that image', text2: 'Try a JPG or PNG.', position: 'bottom' });
+    }
   };
 
   // Guest mode's send flow -- deliberately kept separate from the

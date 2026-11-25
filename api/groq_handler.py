@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 import logging
+import re
 from typing import AsyncGenerator
 from config import GROQ_API_KEY, GROQ_API_URL
 
@@ -110,7 +111,11 @@ async def get_groq_response(messages: list):
             delay = min(delay * 2, 5.0)  # Cap the delay at 5 seconds
 
 
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Groq shut down meta-llama/llama-4-scout-17b-16e-instruct (17 Jul 2026), so
+# every image turn 404'd. qwen3.8-27b is the vision model Groq currently
+# offers outside enterprise access. It is a *preview* model, so check
+# console.groq.com/docs/deprecations if images start failing again.
+VISION_MODEL = "qwen/qwen3.8-27b"
 
 
 async def get_groq_vision_response(system_prompt: str, text: str, image_data_url: str) -> str:
@@ -138,7 +143,8 @@ async def get_groq_vision_response(system_prompt: str, text: str, image_data_url
             },
         ],
         "temperature": 0.7,
-        "max_tokens": 500,
+        # Headroom: Qwen can spend tokens on a <think> block before answering.
+        "max_tokens": 1500,
     }
 
     logger = logging.getLogger("groq_handler")
@@ -149,7 +155,10 @@ async def get_groq_vision_response(system_prompt: str, text: str, image_data_url
             logger.error(f"Groq vision API error {response.status_code}: {response.text}")
             return "Hmm, couldn't look at that image properly. Try again?"
         data = response.json()
-        return data["choices"][0]["message"].get("content", "") or ""
+        content = data["choices"][0]["message"].get("content", "") or ""
+        # Never show reasoning to the user, including a truncated block.
+        content = re.sub(r"<think>.*?(</think>|$)", "", content, flags=re.DOTALL).strip()
+        return content or "Hmm, couldn't look at that image properly. Try again?"
     except Exception as e:
         logger.error(f"Error in get_groq_vision_response: {str(e)}", exc_info=True)
         return "Hmm, couldn't look at that image properly. Try again?"
